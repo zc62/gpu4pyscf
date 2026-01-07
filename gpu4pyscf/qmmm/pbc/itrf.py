@@ -338,7 +338,7 @@ class QMMMSCF(QMMM):
             s = cp.asarray(self.get_ovlp())
             c_inv = self.c_orth.conj().T.dot(s)
             c_inv_H = s.dot(self.c_orth)
-            dm = reduce(cp.dot, (c_inv, s, c_inv_H))
+            dm = reduce(cp.dot, (c_inv, dm, c_inv_H))
         if s1r is None:
             s1r = self.get_s1r()
         aoslices = self.mol.aoslice_by_atom()
@@ -409,7 +409,7 @@ class QMMMSCF(QMMM):
             s = cp.asarray(self.get_ovlp())
             c_inv = self.c_orth.conj().T.dot(s)
             c_inv_H = s.dot(self.c_orth)
-            dm = reduce(cp.dot, (c_inv, s, c_inv_H))
+            dm = reduce(cp.dot, (c_inv, dm, c_inv_H))
         if s1rr is None:
             s1rr = self.get_s1rr()
         aoslices = self.mol.aoslice_by_atom()
@@ -481,7 +481,7 @@ class QMMMSCF(QMMM):
             s = cp.asarray(self.get_ovlp())
             c_inv = self.c_orth.conj().T.dot(s)
             c_inv_H = s.dot(self.c_orth)
-            dm = reduce(cp.dot, (c_inv, s, c_inv_H))
+            dm = reduce(cp.dot, (c_inv, dm, c_inv_H))
         if s1rrr is None:
             s1rrr = self.get_s1rrr()
         aoslices = self.mol.aoslice_by_atom()
