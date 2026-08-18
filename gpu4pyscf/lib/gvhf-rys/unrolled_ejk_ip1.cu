@@ -6,9 +6,19 @@
 #include "gvhf-rys/create_tasks.cu"
 #include "gvhf-rys/unrolled_kernels.cuh"
 
+#define JKENERGY_MULTI_KERNEL_ARGS \
+    JKENERGY_KERNEL_ARGS, double **dms, int *component_id, \
+    int *local_ao_loc, int *component_nao
 
+#define LAUNCH_JKENERGY_MULTI_KERNEL(KERNEL) \
+    KERNEL<multi_in, exclude_component_self><<<workers, threads, buflen*sizeof(double)>>>( \
+    *envs, *jk, *bounds, q_cond_ij, q_cond_kl, dm_penalty, s_cond_ij, s_cond_kl, diffuse_exps, \
+    pool, dd_pool, head, dms, component_id, local_ao_loc, component_nao)
+
+
+template <bool multi_in, bool exclude_component_self>
 __global__ static
-void rys_ejk_ip1_0000(JKENERGY_KERNEL_ARGS)
+void rys_ejk_ip1_0000(JKENERGY_MULTI_KERNEL_ARGS)
 {
     JKENERGY_KERNEL_SETUP();
     constexpr int nsq_per_block = 256;
@@ -45,12 +55,14 @@ while (1) {
     if (jk.omega >= 0) {
         _fill_ejk_tasks(ntasks, pair_kl0, bas_kl_idx, pair_ij, ish, jsh,
                         q_cond_ij, q_cond_kl,
-                        (int *)shared_memory, jk, envs, bounds);
+                        (int *)shared_memory, jk, envs, bounds,
+                        component_id, exclude_component_self);
     } else {
         _fill_sr_ejk_tasks(ntasks, pair_kl0, bas_kl_idx, pair_ij, ish, jsh,
                            q_cond_ij, q_cond_kl,
                            s_cond_ij, s_cond_kl, diffuse_exps,
-                           (int *)shared_memory, jk, envs, bounds);
+                           (int *)shared_memory, jk, envs, bounds,
+                        component_id, exclude_component_self);
     }
     if (ntasks == 0) {
         continue;
@@ -110,6 +122,18 @@ while (1) {
         int j0 = ao_loc[jsh];
         int k0 = ao_loc[ksh];
         int l0 = ao_loc[lsh];
+        double *dm_ij;
+        double *dm_kl;
+        int nao_ij;
+        int nao_kl;
+        if (multi_in) {
+            int component_ij = component_id[ish];
+            int component_kl = component_id[ksh];
+            nao_ij = component_nao[component_ij];
+            nao_kl = component_nao[component_kl];
+            dm_ij = dms[component_ij] + local_ao_loc[jsh]*(size_t)nao_ij + local_ao_loc[ish];
+            dm_kl = dms[component_kl] + local_ao_loc[lsh]*(size_t)nao_kl + local_ao_loc[ksh];
+        }
         int expk = bas[ksh*BAS_SLOTS+PTR_EXP];
         int expl = bas[lsh*BAS_SLOTS+PTR_EXP];
         int ck = bas[ksh*BAS_SLOTS+PTR_COEFF];
@@ -141,8 +165,13 @@ while (1) {
                 dd_cache0 += fac * (dm[(j0+0)*nao+(k0+0)] * dm[(l0+0)*nao+(i0+0)] + dm[(j0+0)*nao+(l0+0)] * dm[(k0+0)*nao+(i0+0)]);
             }
             if (jk.j_factor != 0) {
-                double fac = fac_sym * jk.j_factor;
-                dd_cache0 += fac * dm[(l0+0)*nao+(k0+0)] * dm[(j0+0)*nao+(i0+0)];
+                if (multi_in) {
+                    double fac = fac_sym * jk.j_factor;
+                    dd_cache0 += fac * dm_kl[(0)*nao_kl+(0)] * dm_ij[(0)*nao_ij+(0)];
+                } else {
+                    double fac = fac_sym * jk.j_factor;
+                    dd_cache0 += fac * dm[(l0+0)*nao+(k0+0)] * dm[(j0+0)*nao+(i0+0)];
+                }
             }
         } else {
             double *dmb = dm + nao * nao;
@@ -283,8 +312,9 @@ while (1) {
 }
 }
 
+template <bool multi_in, bool exclude_component_self>
 __global__ static
-void rys_ejk_ip1_1000(JKENERGY_KERNEL_ARGS)
+void rys_ejk_ip1_1000(JKENERGY_MULTI_KERNEL_ARGS)
 {
     JKENERGY_KERNEL_SETUP();
     constexpr int nsq_per_block = 256;
@@ -321,12 +351,14 @@ while (1) {
     if (jk.omega >= 0) {
         _fill_ejk_tasks(ntasks, pair_kl0, bas_kl_idx, pair_ij, ish, jsh,
                         q_cond_ij, q_cond_kl,
-                        (int *)shared_memory, jk, envs, bounds);
+                        (int *)shared_memory, jk, envs, bounds,
+                        component_id, exclude_component_self);
     } else {
         _fill_sr_ejk_tasks(ntasks, pair_kl0, bas_kl_idx, pair_ij, ish, jsh,
                            q_cond_ij, q_cond_kl,
                            s_cond_ij, s_cond_kl, diffuse_exps,
-                           (int *)shared_memory, jk, envs, bounds);
+                           (int *)shared_memory, jk, envs, bounds,
+                        component_id, exclude_component_self);
     }
     if (ntasks == 0) {
         continue;
@@ -386,6 +418,18 @@ while (1) {
         int j0 = ao_loc[jsh];
         int k0 = ao_loc[ksh];
         int l0 = ao_loc[lsh];
+        double *dm_ij;
+        double *dm_kl;
+        int nao_ij;
+        int nao_kl;
+        if (multi_in) {
+            int component_ij = component_id[ish];
+            int component_kl = component_id[ksh];
+            nao_ij = component_nao[component_ij];
+            nao_kl = component_nao[component_kl];
+            dm_ij = dms[component_ij] + local_ao_loc[jsh]*(size_t)nao_ij + local_ao_loc[ish];
+            dm_kl = dms[component_kl] + local_ao_loc[lsh]*(size_t)nao_kl + local_ao_loc[ksh];
+        }
         int expk = bas[ksh*BAS_SLOTS+PTR_EXP];
         int expl = bas[lsh*BAS_SLOTS+PTR_EXP];
         int ck = bas[ksh*BAS_SLOTS+PTR_COEFF];
@@ -421,10 +465,17 @@ while (1) {
                 dd_cache2 += fac * (dm[(j0+0)*nao+(k0+0)] * dm[(l0+0)*nao+(i0+2)] + dm[(j0+0)*nao+(l0+0)] * dm[(k0+0)*nao+(i0+2)]);
             }
             if (jk.j_factor != 0) {
-                double fac = fac_sym * jk.j_factor;
-                dd_cache0 += fac * dm[(l0+0)*nao+(k0+0)] * dm[(j0+0)*nao+(i0+0)];
-                dd_cache1 += fac * dm[(l0+0)*nao+(k0+0)] * dm[(j0+0)*nao+(i0+1)];
-                dd_cache2 += fac * dm[(l0+0)*nao+(k0+0)] * dm[(j0+0)*nao+(i0+2)];
+                if (multi_in) {
+                    double fac = fac_sym * jk.j_factor;
+                    dd_cache0 += fac * dm_kl[(0)*nao_kl+(0)] * dm_ij[(0)*nao_ij+(0)];
+                    dd_cache1 += fac * dm_kl[(0)*nao_kl+(0)] * dm_ij[(0)*nao_ij+(1)];
+                    dd_cache2 += fac * dm_kl[(0)*nao_kl+(0)] * dm_ij[(0)*nao_ij+(2)];
+                } else {
+                    double fac = fac_sym * jk.j_factor;
+                    dd_cache0 += fac * dm[(l0+0)*nao+(k0+0)] * dm[(j0+0)*nao+(i0+0)];
+                    dd_cache1 += fac * dm[(l0+0)*nao+(k0+0)] * dm[(j0+0)*nao+(i0+1)];
+                    dd_cache2 += fac * dm[(l0+0)*nao+(k0+0)] * dm[(j0+0)*nao+(i0+2)];
+                }
             }
         } else {
             double *dmb = dm + nao * nao;
@@ -648,8 +699,9 @@ while (1) {
 }
 }
 
+template <bool multi_in, bool exclude_component_self>
 __global__ static
-void rys_ejk_ip1_1010(JKENERGY_KERNEL_ARGS)
+void rys_ejk_ip1_1010(JKENERGY_MULTI_KERNEL_ARGS)
 {
     JKENERGY_KERNEL_SETUP();
     constexpr int nsq_per_block = 256;
@@ -686,12 +738,14 @@ while (1) {
     if (jk.omega >= 0) {
         _fill_ejk_tasks(ntasks, pair_kl0, bas_kl_idx, pair_ij, ish, jsh,
                         q_cond_ij, q_cond_kl,
-                        (int *)shared_memory, jk, envs, bounds);
+                        (int *)shared_memory, jk, envs, bounds,
+                        component_id, exclude_component_self);
     } else {
         _fill_sr_ejk_tasks(ntasks, pair_kl0, bas_kl_idx, pair_ij, ish, jsh,
                            q_cond_ij, q_cond_kl,
                            s_cond_ij, s_cond_kl, diffuse_exps,
-                           (int *)shared_memory, jk, envs, bounds);
+                           (int *)shared_memory, jk, envs, bounds,
+                        component_id, exclude_component_self);
     }
     if (ntasks == 0) {
         continue;
@@ -751,6 +805,18 @@ while (1) {
         int j0 = ao_loc[jsh];
         int k0 = ao_loc[ksh];
         int l0 = ao_loc[lsh];
+        double *dm_ij;
+        double *dm_kl;
+        int nao_ij;
+        int nao_kl;
+        if (multi_in) {
+            int component_ij = component_id[ish];
+            int component_kl = component_id[ksh];
+            nao_ij = component_nao[component_ij];
+            nao_kl = component_nao[component_kl];
+            dm_ij = dms[component_ij] + local_ao_loc[jsh]*(size_t)nao_ij + local_ao_loc[ish];
+            dm_kl = dms[component_kl] + local_ao_loc[lsh]*(size_t)nao_kl + local_ao_loc[ksh];
+        }
         int expk = bas[ksh*BAS_SLOTS+PTR_EXP];
         int expl = bas[lsh*BAS_SLOTS+PTR_EXP];
         int ck = bas[ksh*BAS_SLOTS+PTR_COEFF];
@@ -798,16 +864,29 @@ while (1) {
                 dd_cache8 += fac * (dm[(j0+0)*nao+(k0+2)] * dm[(l0+0)*nao+(i0+2)] + dm[(j0+0)*nao+(l0+0)] * dm[(k0+2)*nao+(i0+2)]);
             }
             if (jk.j_factor != 0) {
-                double fac = fac_sym * jk.j_factor;
-                dd_cache0 += fac * dm[(l0+0)*nao+(k0+0)] * dm[(j0+0)*nao+(i0+0)];
-                dd_cache1 += fac * dm[(l0+0)*nao+(k0+0)] * dm[(j0+0)*nao+(i0+1)];
-                dd_cache2 += fac * dm[(l0+0)*nao+(k0+0)] * dm[(j0+0)*nao+(i0+2)];
-                dd_cache3 += fac * dm[(l0+0)*nao+(k0+1)] * dm[(j0+0)*nao+(i0+0)];
-                dd_cache4 += fac * dm[(l0+0)*nao+(k0+1)] * dm[(j0+0)*nao+(i0+1)];
-                dd_cache5 += fac * dm[(l0+0)*nao+(k0+1)] * dm[(j0+0)*nao+(i0+2)];
-                dd_cache6 += fac * dm[(l0+0)*nao+(k0+2)] * dm[(j0+0)*nao+(i0+0)];
-                dd_cache7 += fac * dm[(l0+0)*nao+(k0+2)] * dm[(j0+0)*nao+(i0+1)];
-                dd_cache8 += fac * dm[(l0+0)*nao+(k0+2)] * dm[(j0+0)*nao+(i0+2)];
+                if (multi_in) {
+                    double fac = fac_sym * jk.j_factor;
+                    dd_cache0 += fac * dm_kl[(0)*nao_kl+(0)] * dm_ij[(0)*nao_ij+(0)];
+                    dd_cache1 += fac * dm_kl[(0)*nao_kl+(0)] * dm_ij[(0)*nao_ij+(1)];
+                    dd_cache2 += fac * dm_kl[(0)*nao_kl+(0)] * dm_ij[(0)*nao_ij+(2)];
+                    dd_cache3 += fac * dm_kl[(0)*nao_kl+(1)] * dm_ij[(0)*nao_ij+(0)];
+                    dd_cache4 += fac * dm_kl[(0)*nao_kl+(1)] * dm_ij[(0)*nao_ij+(1)];
+                    dd_cache5 += fac * dm_kl[(0)*nao_kl+(1)] * dm_ij[(0)*nao_ij+(2)];
+                    dd_cache6 += fac * dm_kl[(0)*nao_kl+(2)] * dm_ij[(0)*nao_ij+(0)];
+                    dd_cache7 += fac * dm_kl[(0)*nao_kl+(2)] * dm_ij[(0)*nao_ij+(1)];
+                    dd_cache8 += fac * dm_kl[(0)*nao_kl+(2)] * dm_ij[(0)*nao_ij+(2)];
+                } else {
+                    double fac = fac_sym * jk.j_factor;
+                    dd_cache0 += fac * dm[(l0+0)*nao+(k0+0)] * dm[(j0+0)*nao+(i0+0)];
+                    dd_cache1 += fac * dm[(l0+0)*nao+(k0+0)] * dm[(j0+0)*nao+(i0+1)];
+                    dd_cache2 += fac * dm[(l0+0)*nao+(k0+0)] * dm[(j0+0)*nao+(i0+2)];
+                    dd_cache3 += fac * dm[(l0+0)*nao+(k0+1)] * dm[(j0+0)*nao+(i0+0)];
+                    dd_cache4 += fac * dm[(l0+0)*nao+(k0+1)] * dm[(j0+0)*nao+(i0+1)];
+                    dd_cache5 += fac * dm[(l0+0)*nao+(k0+1)] * dm[(j0+0)*nao+(i0+2)];
+                    dd_cache6 += fac * dm[(l0+0)*nao+(k0+2)] * dm[(j0+0)*nao+(i0+0)];
+                    dd_cache7 += fac * dm[(l0+0)*nao+(k0+2)] * dm[(j0+0)*nao+(i0+1)];
+                    dd_cache8 += fac * dm[(l0+0)*nao+(k0+2)] * dm[(j0+0)*nao+(i0+2)];
+                }
             }
         } else {
             double *dmb = dm + nao * nao;
@@ -1266,8 +1345,9 @@ while (1) {
 }
 }
 
+template <bool multi_in, bool exclude_component_self>
 __global__ static
-void rys_ejk_ip1_1011(JKENERGY_KERNEL_ARGS)
+void rys_ejk_ip1_1011(JKENERGY_MULTI_KERNEL_ARGS)
 {
     JKENERGY_KERNEL_SETUP();
     constexpr int nsq_per_block = 256;
@@ -1304,12 +1384,14 @@ while (1) {
     if (jk.omega >= 0) {
         _fill_ejk_tasks(ntasks, pair_kl0, bas_kl_idx, pair_ij, ish, jsh,
                         q_cond_ij, q_cond_kl,
-                        (int *)shared_memory, jk, envs, bounds);
+                        (int *)shared_memory, jk, envs, bounds,
+                        component_id, exclude_component_self);
     } else {
         _fill_sr_ejk_tasks(ntasks, pair_kl0, bas_kl_idx, pair_ij, ish, jsh,
                            q_cond_ij, q_cond_kl,
                            s_cond_ij, s_cond_kl, diffuse_exps,
-                           (int *)shared_memory, jk, envs, bounds);
+                           (int *)shared_memory, jk, envs, bounds,
+                        component_id, exclude_component_self);
     }
     if (ntasks == 0) {
         continue;
@@ -1369,6 +1451,18 @@ while (1) {
         int j0 = ao_loc[jsh];
         int k0 = ao_loc[ksh];
         int l0 = ao_loc[lsh];
+        double *dm_ij;
+        double *dm_kl;
+        int nao_ij;
+        int nao_kl;
+        if (multi_in) {
+            int component_ij = component_id[ish];
+            int component_kl = component_id[ksh];
+            nao_ij = component_nao[component_ij];
+            nao_kl = component_nao[component_kl];
+            dm_ij = dms[component_ij] + local_ao_loc[jsh]*(size_t)nao_ij + local_ao_loc[ish];
+            dm_kl = dms[component_kl] + local_ao_loc[lsh]*(size_t)nao_kl + local_ao_loc[ksh];
+        }
         int expk = bas[ksh*BAS_SLOTS+PTR_EXP];
         int expl = bas[lsh*BAS_SLOTS+PTR_EXP];
         int ck = bas[ksh*BAS_SLOTS+PTR_COEFF];
@@ -1452,34 +1546,65 @@ while (1) {
                 dd_cache26 += fac * (dm[(j0+0)*nao+(k0+2)] * dm[(l0+2)*nao+(i0+2)] + dm[(j0+0)*nao+(l0+2)] * dm[(k0+2)*nao+(i0+2)]);
             }
             if (jk.j_factor != 0) {
-                double fac = fac_sym * jk.j_factor;
-                dd_cache0 += fac * dm[(l0+0)*nao+(k0+0)] * dm[(j0+0)*nao+(i0+0)];
-                dd_cache1 += fac * dm[(l0+0)*nao+(k0+0)] * dm[(j0+0)*nao+(i0+1)];
-                dd_cache2 += fac * dm[(l0+0)*nao+(k0+0)] * dm[(j0+0)*nao+(i0+2)];
-                dd_cache3 += fac * dm[(l0+0)*nao+(k0+1)] * dm[(j0+0)*nao+(i0+0)];
-                dd_cache4 += fac * dm[(l0+0)*nao+(k0+1)] * dm[(j0+0)*nao+(i0+1)];
-                dd_cache5 += fac * dm[(l0+0)*nao+(k0+1)] * dm[(j0+0)*nao+(i0+2)];
-                dd_cache6 += fac * dm[(l0+0)*nao+(k0+2)] * dm[(j0+0)*nao+(i0+0)];
-                dd_cache7 += fac * dm[(l0+0)*nao+(k0+2)] * dm[(j0+0)*nao+(i0+1)];
-                dd_cache8 += fac * dm[(l0+0)*nao+(k0+2)] * dm[(j0+0)*nao+(i0+2)];
-                dd_cache9 += fac * dm[(l0+1)*nao+(k0+0)] * dm[(j0+0)*nao+(i0+0)];
-                dd_cache10 += fac * dm[(l0+1)*nao+(k0+0)] * dm[(j0+0)*nao+(i0+1)];
-                dd_cache11 += fac * dm[(l0+1)*nao+(k0+0)] * dm[(j0+0)*nao+(i0+2)];
-                dd_cache12 += fac * dm[(l0+1)*nao+(k0+1)] * dm[(j0+0)*nao+(i0+0)];
-                dd_cache13 += fac * dm[(l0+1)*nao+(k0+1)] * dm[(j0+0)*nao+(i0+1)];
-                dd_cache14 += fac * dm[(l0+1)*nao+(k0+1)] * dm[(j0+0)*nao+(i0+2)];
-                dd_cache15 += fac * dm[(l0+1)*nao+(k0+2)] * dm[(j0+0)*nao+(i0+0)];
-                dd_cache16 += fac * dm[(l0+1)*nao+(k0+2)] * dm[(j0+0)*nao+(i0+1)];
-                dd_cache17 += fac * dm[(l0+1)*nao+(k0+2)] * dm[(j0+0)*nao+(i0+2)];
-                dd_cache18 += fac * dm[(l0+2)*nao+(k0+0)] * dm[(j0+0)*nao+(i0+0)];
-                dd_cache19 += fac * dm[(l0+2)*nao+(k0+0)] * dm[(j0+0)*nao+(i0+1)];
-                dd_cache20 += fac * dm[(l0+2)*nao+(k0+0)] * dm[(j0+0)*nao+(i0+2)];
-                dd_cache21 += fac * dm[(l0+2)*nao+(k0+1)] * dm[(j0+0)*nao+(i0+0)];
-                dd_cache22 += fac * dm[(l0+2)*nao+(k0+1)] * dm[(j0+0)*nao+(i0+1)];
-                dd_cache23 += fac * dm[(l0+2)*nao+(k0+1)] * dm[(j0+0)*nao+(i0+2)];
-                dd_cache24 += fac * dm[(l0+2)*nao+(k0+2)] * dm[(j0+0)*nao+(i0+0)];
-                dd_cache25 += fac * dm[(l0+2)*nao+(k0+2)] * dm[(j0+0)*nao+(i0+1)];
-                dd_cache26 += fac * dm[(l0+2)*nao+(k0+2)] * dm[(j0+0)*nao+(i0+2)];
+                if (multi_in) {
+                    double fac = fac_sym * jk.j_factor;
+                    dd_cache0 += fac * dm_kl[(0)*nao_kl+(0)] * dm_ij[(0)*nao_ij+(0)];
+                    dd_cache1 += fac * dm_kl[(0)*nao_kl+(0)] * dm_ij[(0)*nao_ij+(1)];
+                    dd_cache2 += fac * dm_kl[(0)*nao_kl+(0)] * dm_ij[(0)*nao_ij+(2)];
+                    dd_cache3 += fac * dm_kl[(0)*nao_kl+(1)] * dm_ij[(0)*nao_ij+(0)];
+                    dd_cache4 += fac * dm_kl[(0)*nao_kl+(1)] * dm_ij[(0)*nao_ij+(1)];
+                    dd_cache5 += fac * dm_kl[(0)*nao_kl+(1)] * dm_ij[(0)*nao_ij+(2)];
+                    dd_cache6 += fac * dm_kl[(0)*nao_kl+(2)] * dm_ij[(0)*nao_ij+(0)];
+                    dd_cache7 += fac * dm_kl[(0)*nao_kl+(2)] * dm_ij[(0)*nao_ij+(1)];
+                    dd_cache8 += fac * dm_kl[(0)*nao_kl+(2)] * dm_ij[(0)*nao_ij+(2)];
+                    dd_cache9 += fac * dm_kl[(1)*nao_kl+(0)] * dm_ij[(0)*nao_ij+(0)];
+                    dd_cache10 += fac * dm_kl[(1)*nao_kl+(0)] * dm_ij[(0)*nao_ij+(1)];
+                    dd_cache11 += fac * dm_kl[(1)*nao_kl+(0)] * dm_ij[(0)*nao_ij+(2)];
+                    dd_cache12 += fac * dm_kl[(1)*nao_kl+(1)] * dm_ij[(0)*nao_ij+(0)];
+                    dd_cache13 += fac * dm_kl[(1)*nao_kl+(1)] * dm_ij[(0)*nao_ij+(1)];
+                    dd_cache14 += fac * dm_kl[(1)*nao_kl+(1)] * dm_ij[(0)*nao_ij+(2)];
+                    dd_cache15 += fac * dm_kl[(1)*nao_kl+(2)] * dm_ij[(0)*nao_ij+(0)];
+                    dd_cache16 += fac * dm_kl[(1)*nao_kl+(2)] * dm_ij[(0)*nao_ij+(1)];
+                    dd_cache17 += fac * dm_kl[(1)*nao_kl+(2)] * dm_ij[(0)*nao_ij+(2)];
+                    dd_cache18 += fac * dm_kl[(2)*nao_kl+(0)] * dm_ij[(0)*nao_ij+(0)];
+                    dd_cache19 += fac * dm_kl[(2)*nao_kl+(0)] * dm_ij[(0)*nao_ij+(1)];
+                    dd_cache20 += fac * dm_kl[(2)*nao_kl+(0)] * dm_ij[(0)*nao_ij+(2)];
+                    dd_cache21 += fac * dm_kl[(2)*nao_kl+(1)] * dm_ij[(0)*nao_ij+(0)];
+                    dd_cache22 += fac * dm_kl[(2)*nao_kl+(1)] * dm_ij[(0)*nao_ij+(1)];
+                    dd_cache23 += fac * dm_kl[(2)*nao_kl+(1)] * dm_ij[(0)*nao_ij+(2)];
+                    dd_cache24 += fac * dm_kl[(2)*nao_kl+(2)] * dm_ij[(0)*nao_ij+(0)];
+                    dd_cache25 += fac * dm_kl[(2)*nao_kl+(2)] * dm_ij[(0)*nao_ij+(1)];
+                    dd_cache26 += fac * dm_kl[(2)*nao_kl+(2)] * dm_ij[(0)*nao_ij+(2)];
+                } else {
+                    double fac = fac_sym * jk.j_factor;
+                    dd_cache0 += fac * dm[(l0+0)*nao+(k0+0)] * dm[(j0+0)*nao+(i0+0)];
+                    dd_cache1 += fac * dm[(l0+0)*nao+(k0+0)] * dm[(j0+0)*nao+(i0+1)];
+                    dd_cache2 += fac * dm[(l0+0)*nao+(k0+0)] * dm[(j0+0)*nao+(i0+2)];
+                    dd_cache3 += fac * dm[(l0+0)*nao+(k0+1)] * dm[(j0+0)*nao+(i0+0)];
+                    dd_cache4 += fac * dm[(l0+0)*nao+(k0+1)] * dm[(j0+0)*nao+(i0+1)];
+                    dd_cache5 += fac * dm[(l0+0)*nao+(k0+1)] * dm[(j0+0)*nao+(i0+2)];
+                    dd_cache6 += fac * dm[(l0+0)*nao+(k0+2)] * dm[(j0+0)*nao+(i0+0)];
+                    dd_cache7 += fac * dm[(l0+0)*nao+(k0+2)] * dm[(j0+0)*nao+(i0+1)];
+                    dd_cache8 += fac * dm[(l0+0)*nao+(k0+2)] * dm[(j0+0)*nao+(i0+2)];
+                    dd_cache9 += fac * dm[(l0+1)*nao+(k0+0)] * dm[(j0+0)*nao+(i0+0)];
+                    dd_cache10 += fac * dm[(l0+1)*nao+(k0+0)] * dm[(j0+0)*nao+(i0+1)];
+                    dd_cache11 += fac * dm[(l0+1)*nao+(k0+0)] * dm[(j0+0)*nao+(i0+2)];
+                    dd_cache12 += fac * dm[(l0+1)*nao+(k0+1)] * dm[(j0+0)*nao+(i0+0)];
+                    dd_cache13 += fac * dm[(l0+1)*nao+(k0+1)] * dm[(j0+0)*nao+(i0+1)];
+                    dd_cache14 += fac * dm[(l0+1)*nao+(k0+1)] * dm[(j0+0)*nao+(i0+2)];
+                    dd_cache15 += fac * dm[(l0+1)*nao+(k0+2)] * dm[(j0+0)*nao+(i0+0)];
+                    dd_cache16 += fac * dm[(l0+1)*nao+(k0+2)] * dm[(j0+0)*nao+(i0+1)];
+                    dd_cache17 += fac * dm[(l0+1)*nao+(k0+2)] * dm[(j0+0)*nao+(i0+2)];
+                    dd_cache18 += fac * dm[(l0+2)*nao+(k0+0)] * dm[(j0+0)*nao+(i0+0)];
+                    dd_cache19 += fac * dm[(l0+2)*nao+(k0+0)] * dm[(j0+0)*nao+(i0+1)];
+                    dd_cache20 += fac * dm[(l0+2)*nao+(k0+0)] * dm[(j0+0)*nao+(i0+2)];
+                    dd_cache21 += fac * dm[(l0+2)*nao+(k0+1)] * dm[(j0+0)*nao+(i0+0)];
+                    dd_cache22 += fac * dm[(l0+2)*nao+(k0+1)] * dm[(j0+0)*nao+(i0+1)];
+                    dd_cache23 += fac * dm[(l0+2)*nao+(k0+1)] * dm[(j0+0)*nao+(i0+2)];
+                    dd_cache24 += fac * dm[(l0+2)*nao+(k0+2)] * dm[(j0+0)*nao+(i0+0)];
+                    dd_cache25 += fac * dm[(l0+2)*nao+(k0+2)] * dm[(j0+0)*nao+(i0+1)];
+                    dd_cache26 += fac * dm[(l0+2)*nao+(k0+2)] * dm[(j0+0)*nao+(i0+2)];
+                }
             }
         } else {
             double *dmb = dm + nao * nao;
@@ -2640,8 +2765,9 @@ while (1) {
 }
 }
 
+template <bool multi_in, bool exclude_component_self>
 __global__ static
-void rys_ejk_ip1_1100(JKENERGY_KERNEL_ARGS)
+void rys_ejk_ip1_1100(JKENERGY_MULTI_KERNEL_ARGS)
 {
     JKENERGY_KERNEL_SETUP();
     constexpr int nsq_per_block = 256;
@@ -2678,12 +2804,14 @@ while (1) {
     if (jk.omega >= 0) {
         _fill_ejk_tasks(ntasks, pair_kl0, bas_kl_idx, pair_ij, ish, jsh,
                         q_cond_ij, q_cond_kl,
-                        (int *)shared_memory, jk, envs, bounds);
+                        (int *)shared_memory, jk, envs, bounds,
+                        component_id, exclude_component_self);
     } else {
         _fill_sr_ejk_tasks(ntasks, pair_kl0, bas_kl_idx, pair_ij, ish, jsh,
                            q_cond_ij, q_cond_kl,
                            s_cond_ij, s_cond_kl, diffuse_exps,
-                           (int *)shared_memory, jk, envs, bounds);
+                           (int *)shared_memory, jk, envs, bounds,
+                        component_id, exclude_component_self);
     }
     if (ntasks == 0) {
         continue;
@@ -2743,6 +2871,18 @@ while (1) {
         int j0 = ao_loc[jsh];
         int k0 = ao_loc[ksh];
         int l0 = ao_loc[lsh];
+        double *dm_ij;
+        double *dm_kl;
+        int nao_ij;
+        int nao_kl;
+        if (multi_in) {
+            int component_ij = component_id[ish];
+            int component_kl = component_id[ksh];
+            nao_ij = component_nao[component_ij];
+            nao_kl = component_nao[component_kl];
+            dm_ij = dms[component_ij] + local_ao_loc[jsh]*(size_t)nao_ij + local_ao_loc[ish];
+            dm_kl = dms[component_kl] + local_ao_loc[lsh]*(size_t)nao_kl + local_ao_loc[ksh];
+        }
         int expk = bas[ksh*BAS_SLOTS+PTR_EXP];
         int expl = bas[lsh*BAS_SLOTS+PTR_EXP];
         int ck = bas[ksh*BAS_SLOTS+PTR_COEFF];
@@ -2790,16 +2930,29 @@ while (1) {
                 dd_cache8 += fac * (dm[(j0+2)*nao+(k0+0)] * dm[(l0+0)*nao+(i0+2)] + dm[(j0+2)*nao+(l0+0)] * dm[(k0+0)*nao+(i0+2)]);
             }
             if (jk.j_factor != 0) {
-                double fac = fac_sym * jk.j_factor;
-                dd_cache0 += fac * dm[(l0+0)*nao+(k0+0)] * dm[(j0+0)*nao+(i0+0)];
-                dd_cache1 += fac * dm[(l0+0)*nao+(k0+0)] * dm[(j0+0)*nao+(i0+1)];
-                dd_cache2 += fac * dm[(l0+0)*nao+(k0+0)] * dm[(j0+0)*nao+(i0+2)];
-                dd_cache3 += fac * dm[(l0+0)*nao+(k0+0)] * dm[(j0+1)*nao+(i0+0)];
-                dd_cache4 += fac * dm[(l0+0)*nao+(k0+0)] * dm[(j0+1)*nao+(i0+1)];
-                dd_cache5 += fac * dm[(l0+0)*nao+(k0+0)] * dm[(j0+1)*nao+(i0+2)];
-                dd_cache6 += fac * dm[(l0+0)*nao+(k0+0)] * dm[(j0+2)*nao+(i0+0)];
-                dd_cache7 += fac * dm[(l0+0)*nao+(k0+0)] * dm[(j0+2)*nao+(i0+1)];
-                dd_cache8 += fac * dm[(l0+0)*nao+(k0+0)] * dm[(j0+2)*nao+(i0+2)];
+                if (multi_in) {
+                    double fac = fac_sym * jk.j_factor;
+                    dd_cache0 += fac * dm_kl[(0)*nao_kl+(0)] * dm_ij[(0)*nao_ij+(0)];
+                    dd_cache1 += fac * dm_kl[(0)*nao_kl+(0)] * dm_ij[(0)*nao_ij+(1)];
+                    dd_cache2 += fac * dm_kl[(0)*nao_kl+(0)] * dm_ij[(0)*nao_ij+(2)];
+                    dd_cache3 += fac * dm_kl[(0)*nao_kl+(0)] * dm_ij[(1)*nao_ij+(0)];
+                    dd_cache4 += fac * dm_kl[(0)*nao_kl+(0)] * dm_ij[(1)*nao_ij+(1)];
+                    dd_cache5 += fac * dm_kl[(0)*nao_kl+(0)] * dm_ij[(1)*nao_ij+(2)];
+                    dd_cache6 += fac * dm_kl[(0)*nao_kl+(0)] * dm_ij[(2)*nao_ij+(0)];
+                    dd_cache7 += fac * dm_kl[(0)*nao_kl+(0)] * dm_ij[(2)*nao_ij+(1)];
+                    dd_cache8 += fac * dm_kl[(0)*nao_kl+(0)] * dm_ij[(2)*nao_ij+(2)];
+                } else {
+                    double fac = fac_sym * jk.j_factor;
+                    dd_cache0 += fac * dm[(l0+0)*nao+(k0+0)] * dm[(j0+0)*nao+(i0+0)];
+                    dd_cache1 += fac * dm[(l0+0)*nao+(k0+0)] * dm[(j0+0)*nao+(i0+1)];
+                    dd_cache2 += fac * dm[(l0+0)*nao+(k0+0)] * dm[(j0+0)*nao+(i0+2)];
+                    dd_cache3 += fac * dm[(l0+0)*nao+(k0+0)] * dm[(j0+1)*nao+(i0+0)];
+                    dd_cache4 += fac * dm[(l0+0)*nao+(k0+0)] * dm[(j0+1)*nao+(i0+1)];
+                    dd_cache5 += fac * dm[(l0+0)*nao+(k0+0)] * dm[(j0+1)*nao+(i0+2)];
+                    dd_cache6 += fac * dm[(l0+0)*nao+(k0+0)] * dm[(j0+2)*nao+(i0+0)];
+                    dd_cache7 += fac * dm[(l0+0)*nao+(k0+0)] * dm[(j0+2)*nao+(i0+1)];
+                    dd_cache8 += fac * dm[(l0+0)*nao+(k0+0)] * dm[(j0+2)*nao+(i0+2)];
+                }
             }
         } else {
             double *dmb = dm + nao * nao;
@@ -3266,8 +3419,9 @@ while (1) {
 }
 }
 
+template <bool multi_in, bool exclude_component_self>
 __global__ static
-void rys_ejk_ip1_1110(JKENERGY_KERNEL_ARGS)
+void rys_ejk_ip1_1110(JKENERGY_MULTI_KERNEL_ARGS)
 {
     JKENERGY_KERNEL_SETUP();
     constexpr int nsq_per_block = 256;
@@ -3304,12 +3458,14 @@ while (1) {
     if (jk.omega >= 0) {
         _fill_ejk_tasks(ntasks, pair_kl0, bas_kl_idx, pair_ij, ish, jsh,
                         q_cond_ij, q_cond_kl,
-                        (int *)shared_memory, jk, envs, bounds);
+                        (int *)shared_memory, jk, envs, bounds,
+                        component_id, exclude_component_self);
     } else {
         _fill_sr_ejk_tasks(ntasks, pair_kl0, bas_kl_idx, pair_ij, ish, jsh,
                            q_cond_ij, q_cond_kl,
                            s_cond_ij, s_cond_kl, diffuse_exps,
-                           (int *)shared_memory, jk, envs, bounds);
+                           (int *)shared_memory, jk, envs, bounds,
+                        component_id, exclude_component_self);
     }
     if (ntasks == 0) {
         continue;
@@ -3369,6 +3525,18 @@ while (1) {
         int j0 = ao_loc[jsh];
         int k0 = ao_loc[ksh];
         int l0 = ao_loc[lsh];
+        double *dm_ij;
+        double *dm_kl;
+        int nao_ij;
+        int nao_kl;
+        if (multi_in) {
+            int component_ij = component_id[ish];
+            int component_kl = component_id[ksh];
+            nao_ij = component_nao[component_ij];
+            nao_kl = component_nao[component_kl];
+            dm_ij = dms[component_ij] + local_ao_loc[jsh]*(size_t)nao_ij + local_ao_loc[ish];
+            dm_kl = dms[component_kl] + local_ao_loc[lsh]*(size_t)nao_kl + local_ao_loc[ksh];
+        }
         int expk = bas[ksh*BAS_SLOTS+PTR_EXP];
         int expl = bas[lsh*BAS_SLOTS+PTR_EXP];
         int ck = bas[ksh*BAS_SLOTS+PTR_COEFF];
@@ -3452,34 +3620,65 @@ while (1) {
                 dd_cache26 += fac * (dm[(j0+2)*nao+(k0+2)] * dm[(l0+0)*nao+(i0+2)] + dm[(j0+2)*nao+(l0+0)] * dm[(k0+2)*nao+(i0+2)]);
             }
             if (jk.j_factor != 0) {
-                double fac = fac_sym * jk.j_factor;
-                dd_cache0 += fac * dm[(l0+0)*nao+(k0+0)] * dm[(j0+0)*nao+(i0+0)];
-                dd_cache1 += fac * dm[(l0+0)*nao+(k0+0)] * dm[(j0+0)*nao+(i0+1)];
-                dd_cache2 += fac * dm[(l0+0)*nao+(k0+0)] * dm[(j0+0)*nao+(i0+2)];
-                dd_cache3 += fac * dm[(l0+0)*nao+(k0+0)] * dm[(j0+1)*nao+(i0+0)];
-                dd_cache4 += fac * dm[(l0+0)*nao+(k0+0)] * dm[(j0+1)*nao+(i0+1)];
-                dd_cache5 += fac * dm[(l0+0)*nao+(k0+0)] * dm[(j0+1)*nao+(i0+2)];
-                dd_cache6 += fac * dm[(l0+0)*nao+(k0+0)] * dm[(j0+2)*nao+(i0+0)];
-                dd_cache7 += fac * dm[(l0+0)*nao+(k0+0)] * dm[(j0+2)*nao+(i0+1)];
-                dd_cache8 += fac * dm[(l0+0)*nao+(k0+0)] * dm[(j0+2)*nao+(i0+2)];
-                dd_cache9 += fac * dm[(l0+0)*nao+(k0+1)] * dm[(j0+0)*nao+(i0+0)];
-                dd_cache10 += fac * dm[(l0+0)*nao+(k0+1)] * dm[(j0+0)*nao+(i0+1)];
-                dd_cache11 += fac * dm[(l0+0)*nao+(k0+1)] * dm[(j0+0)*nao+(i0+2)];
-                dd_cache12 += fac * dm[(l0+0)*nao+(k0+1)] * dm[(j0+1)*nao+(i0+0)];
-                dd_cache13 += fac * dm[(l0+0)*nao+(k0+1)] * dm[(j0+1)*nao+(i0+1)];
-                dd_cache14 += fac * dm[(l0+0)*nao+(k0+1)] * dm[(j0+1)*nao+(i0+2)];
-                dd_cache15 += fac * dm[(l0+0)*nao+(k0+1)] * dm[(j0+2)*nao+(i0+0)];
-                dd_cache16 += fac * dm[(l0+0)*nao+(k0+1)] * dm[(j0+2)*nao+(i0+1)];
-                dd_cache17 += fac * dm[(l0+0)*nao+(k0+1)] * dm[(j0+2)*nao+(i0+2)];
-                dd_cache18 += fac * dm[(l0+0)*nao+(k0+2)] * dm[(j0+0)*nao+(i0+0)];
-                dd_cache19 += fac * dm[(l0+0)*nao+(k0+2)] * dm[(j0+0)*nao+(i0+1)];
-                dd_cache20 += fac * dm[(l0+0)*nao+(k0+2)] * dm[(j0+0)*nao+(i0+2)];
-                dd_cache21 += fac * dm[(l0+0)*nao+(k0+2)] * dm[(j0+1)*nao+(i0+0)];
-                dd_cache22 += fac * dm[(l0+0)*nao+(k0+2)] * dm[(j0+1)*nao+(i0+1)];
-                dd_cache23 += fac * dm[(l0+0)*nao+(k0+2)] * dm[(j0+1)*nao+(i0+2)];
-                dd_cache24 += fac * dm[(l0+0)*nao+(k0+2)] * dm[(j0+2)*nao+(i0+0)];
-                dd_cache25 += fac * dm[(l0+0)*nao+(k0+2)] * dm[(j0+2)*nao+(i0+1)];
-                dd_cache26 += fac * dm[(l0+0)*nao+(k0+2)] * dm[(j0+2)*nao+(i0+2)];
+                if (multi_in) {
+                    double fac = fac_sym * jk.j_factor;
+                    dd_cache0 += fac * dm_kl[(0)*nao_kl+(0)] * dm_ij[(0)*nao_ij+(0)];
+                    dd_cache1 += fac * dm_kl[(0)*nao_kl+(0)] * dm_ij[(0)*nao_ij+(1)];
+                    dd_cache2 += fac * dm_kl[(0)*nao_kl+(0)] * dm_ij[(0)*nao_ij+(2)];
+                    dd_cache3 += fac * dm_kl[(0)*nao_kl+(0)] * dm_ij[(1)*nao_ij+(0)];
+                    dd_cache4 += fac * dm_kl[(0)*nao_kl+(0)] * dm_ij[(1)*nao_ij+(1)];
+                    dd_cache5 += fac * dm_kl[(0)*nao_kl+(0)] * dm_ij[(1)*nao_ij+(2)];
+                    dd_cache6 += fac * dm_kl[(0)*nao_kl+(0)] * dm_ij[(2)*nao_ij+(0)];
+                    dd_cache7 += fac * dm_kl[(0)*nao_kl+(0)] * dm_ij[(2)*nao_ij+(1)];
+                    dd_cache8 += fac * dm_kl[(0)*nao_kl+(0)] * dm_ij[(2)*nao_ij+(2)];
+                    dd_cache9 += fac * dm_kl[(0)*nao_kl+(1)] * dm_ij[(0)*nao_ij+(0)];
+                    dd_cache10 += fac * dm_kl[(0)*nao_kl+(1)] * dm_ij[(0)*nao_ij+(1)];
+                    dd_cache11 += fac * dm_kl[(0)*nao_kl+(1)] * dm_ij[(0)*nao_ij+(2)];
+                    dd_cache12 += fac * dm_kl[(0)*nao_kl+(1)] * dm_ij[(1)*nao_ij+(0)];
+                    dd_cache13 += fac * dm_kl[(0)*nao_kl+(1)] * dm_ij[(1)*nao_ij+(1)];
+                    dd_cache14 += fac * dm_kl[(0)*nao_kl+(1)] * dm_ij[(1)*nao_ij+(2)];
+                    dd_cache15 += fac * dm_kl[(0)*nao_kl+(1)] * dm_ij[(2)*nao_ij+(0)];
+                    dd_cache16 += fac * dm_kl[(0)*nao_kl+(1)] * dm_ij[(2)*nao_ij+(1)];
+                    dd_cache17 += fac * dm_kl[(0)*nao_kl+(1)] * dm_ij[(2)*nao_ij+(2)];
+                    dd_cache18 += fac * dm_kl[(0)*nao_kl+(2)] * dm_ij[(0)*nao_ij+(0)];
+                    dd_cache19 += fac * dm_kl[(0)*nao_kl+(2)] * dm_ij[(0)*nao_ij+(1)];
+                    dd_cache20 += fac * dm_kl[(0)*nao_kl+(2)] * dm_ij[(0)*nao_ij+(2)];
+                    dd_cache21 += fac * dm_kl[(0)*nao_kl+(2)] * dm_ij[(1)*nao_ij+(0)];
+                    dd_cache22 += fac * dm_kl[(0)*nao_kl+(2)] * dm_ij[(1)*nao_ij+(1)];
+                    dd_cache23 += fac * dm_kl[(0)*nao_kl+(2)] * dm_ij[(1)*nao_ij+(2)];
+                    dd_cache24 += fac * dm_kl[(0)*nao_kl+(2)] * dm_ij[(2)*nao_ij+(0)];
+                    dd_cache25 += fac * dm_kl[(0)*nao_kl+(2)] * dm_ij[(2)*nao_ij+(1)];
+                    dd_cache26 += fac * dm_kl[(0)*nao_kl+(2)] * dm_ij[(2)*nao_ij+(2)];
+                } else {
+                    double fac = fac_sym * jk.j_factor;
+                    dd_cache0 += fac * dm[(l0+0)*nao+(k0+0)] * dm[(j0+0)*nao+(i0+0)];
+                    dd_cache1 += fac * dm[(l0+0)*nao+(k0+0)] * dm[(j0+0)*nao+(i0+1)];
+                    dd_cache2 += fac * dm[(l0+0)*nao+(k0+0)] * dm[(j0+0)*nao+(i0+2)];
+                    dd_cache3 += fac * dm[(l0+0)*nao+(k0+0)] * dm[(j0+1)*nao+(i0+0)];
+                    dd_cache4 += fac * dm[(l0+0)*nao+(k0+0)] * dm[(j0+1)*nao+(i0+1)];
+                    dd_cache5 += fac * dm[(l0+0)*nao+(k0+0)] * dm[(j0+1)*nao+(i0+2)];
+                    dd_cache6 += fac * dm[(l0+0)*nao+(k0+0)] * dm[(j0+2)*nao+(i0+0)];
+                    dd_cache7 += fac * dm[(l0+0)*nao+(k0+0)] * dm[(j0+2)*nao+(i0+1)];
+                    dd_cache8 += fac * dm[(l0+0)*nao+(k0+0)] * dm[(j0+2)*nao+(i0+2)];
+                    dd_cache9 += fac * dm[(l0+0)*nao+(k0+1)] * dm[(j0+0)*nao+(i0+0)];
+                    dd_cache10 += fac * dm[(l0+0)*nao+(k0+1)] * dm[(j0+0)*nao+(i0+1)];
+                    dd_cache11 += fac * dm[(l0+0)*nao+(k0+1)] * dm[(j0+0)*nao+(i0+2)];
+                    dd_cache12 += fac * dm[(l0+0)*nao+(k0+1)] * dm[(j0+1)*nao+(i0+0)];
+                    dd_cache13 += fac * dm[(l0+0)*nao+(k0+1)] * dm[(j0+1)*nao+(i0+1)];
+                    dd_cache14 += fac * dm[(l0+0)*nao+(k0+1)] * dm[(j0+1)*nao+(i0+2)];
+                    dd_cache15 += fac * dm[(l0+0)*nao+(k0+1)] * dm[(j0+2)*nao+(i0+0)];
+                    dd_cache16 += fac * dm[(l0+0)*nao+(k0+1)] * dm[(j0+2)*nao+(i0+1)];
+                    dd_cache17 += fac * dm[(l0+0)*nao+(k0+1)] * dm[(j0+2)*nao+(i0+2)];
+                    dd_cache18 += fac * dm[(l0+0)*nao+(k0+2)] * dm[(j0+0)*nao+(i0+0)];
+                    dd_cache19 += fac * dm[(l0+0)*nao+(k0+2)] * dm[(j0+0)*nao+(i0+1)];
+                    dd_cache20 += fac * dm[(l0+0)*nao+(k0+2)] * dm[(j0+0)*nao+(i0+2)];
+                    dd_cache21 += fac * dm[(l0+0)*nao+(k0+2)] * dm[(j0+1)*nao+(i0+0)];
+                    dd_cache22 += fac * dm[(l0+0)*nao+(k0+2)] * dm[(j0+1)*nao+(i0+1)];
+                    dd_cache23 += fac * dm[(l0+0)*nao+(k0+2)] * dm[(j0+1)*nao+(i0+2)];
+                    dd_cache24 += fac * dm[(l0+0)*nao+(k0+2)] * dm[(j0+2)*nao+(i0+0)];
+                    dd_cache25 += fac * dm[(l0+0)*nao+(k0+2)] * dm[(j0+2)*nao+(i0+1)];
+                    dd_cache26 += fac * dm[(l0+0)*nao+(k0+2)] * dm[(j0+2)*nao+(i0+2)];
+                }
             }
         } else {
             double *dmb = dm + nao * nao;
@@ -4646,8 +4845,9 @@ while (1) {
 }
 }
 
+template <bool multi_in, bool exclude_component_self>
 __global__ static
-void rys_ejk_ip1_1111(JKENERGY_KERNEL_ARGS)
+void rys_ejk_ip1_1111(JKENERGY_MULTI_KERNEL_ARGS)
 {
     JKENERGY_KERNEL_SETUP();
     constexpr int nsq_per_block = 32;
@@ -4688,12 +4888,14 @@ while (1) {
     if (jk.omega >= 0) {
         _fill_ejk_tasks(ntasks, pair_kl0, bas_kl_idx, pair_ij, ish, jsh,
                         q_cond_ij, q_cond_kl,
-                        (int *)shared_memory, jk, envs, bounds);
+                        (int *)shared_memory, jk, envs, bounds,
+                        component_id, exclude_component_self);
     } else {
         _fill_sr_ejk_tasks(ntasks, pair_kl0, bas_kl_idx, pair_ij, ish, jsh,
                            q_cond_ij, q_cond_kl,
                            s_cond_ij, s_cond_kl, diffuse_exps,
-                           (int *)shared_memory, jk, envs, bounds);
+                           (int *)shared_memory, jk, envs, bounds,
+                        component_id, exclude_component_self);
     }
     if (ntasks == 0) {
         continue;
@@ -4753,6 +4955,18 @@ while (1) {
         int j0 = ao_loc[jsh];
         int k0 = ao_loc[ksh];
         int l0 = ao_loc[lsh];
+        double *dm_ij;
+        double *dm_kl;
+        int nao_ij;
+        int nao_kl;
+        if (multi_in) {
+            int component_ij = component_id[ish];
+            int component_kl = component_id[ksh];
+            nao_ij = component_nao[component_ij];
+            nao_kl = component_nao[component_kl];
+            dm_ij = dms[component_ij] + local_ao_loc[jsh]*(size_t)nao_ij + local_ao_loc[ish];
+            dm_kl = dms[component_kl] + local_ao_loc[lsh]*(size_t)nao_kl + local_ao_loc[ksh];
+        }
         int expk = bas[ksh*BAS_SLOTS+PTR_EXP];
         int expl = bas[lsh*BAS_SLOTS+PTR_EXP];
         int ck = bas[ksh*BAS_SLOTS+PTR_COEFF];
@@ -4803,7 +5017,11 @@ while (1) {
                     dd += jk.k_factor * (dm[_jk] * dm[_li] + dm[_jl] * dm[_ki]);
                 }
                 if (do_j) {
-                    dd += jk.j_factor * dm[_ji] * dm[_lk];
+                    if (multi_in) {
+                        dd += jk.j_factor * dm_ij[j*nao_ij+i] * dm_kl[l*nao_kl+k];
+                    } else {
+                        dd += jk.j_factor * dm[_ji] * dm[_lk];
+                    }
                 }
                 dd_cache[n*32] = fac_sym * dd;
             }
@@ -6644,8 +6862,9 @@ while (1) {
 }
 }
 
+template <bool multi_in, bool exclude_component_self>
 __global__ static
-void rys_ejk_ip1_2000(JKENERGY_KERNEL_ARGS)
+void rys_ejk_ip1_2000(JKENERGY_MULTI_KERNEL_ARGS)
 {
     JKENERGY_KERNEL_SETUP();
     constexpr int nsq_per_block = 256;
@@ -6682,12 +6901,14 @@ while (1) {
     if (jk.omega >= 0) {
         _fill_ejk_tasks(ntasks, pair_kl0, bas_kl_idx, pair_ij, ish, jsh,
                         q_cond_ij, q_cond_kl,
-                        (int *)shared_memory, jk, envs, bounds);
+                        (int *)shared_memory, jk, envs, bounds,
+                        component_id, exclude_component_self);
     } else {
         _fill_sr_ejk_tasks(ntasks, pair_kl0, bas_kl_idx, pair_ij, ish, jsh,
                            q_cond_ij, q_cond_kl,
                            s_cond_ij, s_cond_kl, diffuse_exps,
-                           (int *)shared_memory, jk, envs, bounds);
+                           (int *)shared_memory, jk, envs, bounds,
+                        component_id, exclude_component_self);
     }
     if (ntasks == 0) {
         continue;
@@ -6747,6 +6968,18 @@ while (1) {
         int j0 = ao_loc[jsh];
         int k0 = ao_loc[ksh];
         int l0 = ao_loc[lsh];
+        double *dm_ij;
+        double *dm_kl;
+        int nao_ij;
+        int nao_kl;
+        if (multi_in) {
+            int component_ij = component_id[ish];
+            int component_kl = component_id[ksh];
+            nao_ij = component_nao[component_ij];
+            nao_kl = component_nao[component_kl];
+            dm_ij = dms[component_ij] + local_ao_loc[jsh]*(size_t)nao_ij + local_ao_loc[ish];
+            dm_kl = dms[component_kl] + local_ao_loc[lsh]*(size_t)nao_kl + local_ao_loc[ksh];
+        }
         int expk = bas[ksh*BAS_SLOTS+PTR_EXP];
         int expl = bas[lsh*BAS_SLOTS+PTR_EXP];
         int ck = bas[ksh*BAS_SLOTS+PTR_COEFF];
@@ -6788,13 +7021,23 @@ while (1) {
                 dd_cache5 += fac * (dm[(j0+0)*nao+(k0+0)] * dm[(l0+0)*nao+(i0+5)] + dm[(j0+0)*nao+(l0+0)] * dm[(k0+0)*nao+(i0+5)]);
             }
             if (jk.j_factor != 0) {
-                double fac = fac_sym * jk.j_factor;
-                dd_cache0 += fac * dm[(l0+0)*nao+(k0+0)] * dm[(j0+0)*nao+(i0+0)];
-                dd_cache1 += fac * dm[(l0+0)*nao+(k0+0)] * dm[(j0+0)*nao+(i0+1)];
-                dd_cache2 += fac * dm[(l0+0)*nao+(k0+0)] * dm[(j0+0)*nao+(i0+2)];
-                dd_cache3 += fac * dm[(l0+0)*nao+(k0+0)] * dm[(j0+0)*nao+(i0+3)];
-                dd_cache4 += fac * dm[(l0+0)*nao+(k0+0)] * dm[(j0+0)*nao+(i0+4)];
-                dd_cache5 += fac * dm[(l0+0)*nao+(k0+0)] * dm[(j0+0)*nao+(i0+5)];
+                if (multi_in) {
+                    double fac = fac_sym * jk.j_factor;
+                    dd_cache0 += fac * dm_kl[(0)*nao_kl+(0)] * dm_ij[(0)*nao_ij+(0)];
+                    dd_cache1 += fac * dm_kl[(0)*nao_kl+(0)] * dm_ij[(0)*nao_ij+(1)];
+                    dd_cache2 += fac * dm_kl[(0)*nao_kl+(0)] * dm_ij[(0)*nao_ij+(2)];
+                    dd_cache3 += fac * dm_kl[(0)*nao_kl+(0)] * dm_ij[(0)*nao_ij+(3)];
+                    dd_cache4 += fac * dm_kl[(0)*nao_kl+(0)] * dm_ij[(0)*nao_ij+(4)];
+                    dd_cache5 += fac * dm_kl[(0)*nao_kl+(0)] * dm_ij[(0)*nao_ij+(5)];
+                } else {
+                    double fac = fac_sym * jk.j_factor;
+                    dd_cache0 += fac * dm[(l0+0)*nao+(k0+0)] * dm[(j0+0)*nao+(i0+0)];
+                    dd_cache1 += fac * dm[(l0+0)*nao+(k0+0)] * dm[(j0+0)*nao+(i0+1)];
+                    dd_cache2 += fac * dm[(l0+0)*nao+(k0+0)] * dm[(j0+0)*nao+(i0+2)];
+                    dd_cache3 += fac * dm[(l0+0)*nao+(k0+0)] * dm[(j0+0)*nao+(i0+3)];
+                    dd_cache4 += fac * dm[(l0+0)*nao+(k0+0)] * dm[(j0+0)*nao+(i0+4)];
+                    dd_cache5 += fac * dm[(l0+0)*nao+(k0+0)] * dm[(j0+0)*nao+(i0+5)];
+                }
             }
         } else {
             double *dmb = dm + nao * nao;
@@ -7135,8 +7378,9 @@ while (1) {
 }
 }
 
+template <bool multi_in, bool exclude_component_self>
 __global__ static
-void rys_ejk_ip1_2010(JKENERGY_KERNEL_ARGS)
+void rys_ejk_ip1_2010(JKENERGY_MULTI_KERNEL_ARGS)
 {
     JKENERGY_KERNEL_SETUP();
     constexpr int nsq_per_block = 256;
@@ -7173,12 +7417,14 @@ while (1) {
     if (jk.omega >= 0) {
         _fill_ejk_tasks(ntasks, pair_kl0, bas_kl_idx, pair_ij, ish, jsh,
                         q_cond_ij, q_cond_kl,
-                        (int *)shared_memory, jk, envs, bounds);
+                        (int *)shared_memory, jk, envs, bounds,
+                        component_id, exclude_component_self);
     } else {
         _fill_sr_ejk_tasks(ntasks, pair_kl0, bas_kl_idx, pair_ij, ish, jsh,
                            q_cond_ij, q_cond_kl,
                            s_cond_ij, s_cond_kl, diffuse_exps,
-                           (int *)shared_memory, jk, envs, bounds);
+                           (int *)shared_memory, jk, envs, bounds,
+                        component_id, exclude_component_self);
     }
     if (ntasks == 0) {
         continue;
@@ -7238,6 +7484,18 @@ while (1) {
         int j0 = ao_loc[jsh];
         int k0 = ao_loc[ksh];
         int l0 = ao_loc[lsh];
+        double *dm_ij;
+        double *dm_kl;
+        int nao_ij;
+        int nao_kl;
+        if (multi_in) {
+            int component_ij = component_id[ish];
+            int component_kl = component_id[ksh];
+            nao_ij = component_nao[component_ij];
+            nao_kl = component_nao[component_kl];
+            dm_ij = dms[component_ij] + local_ao_loc[jsh]*(size_t)nao_ij + local_ao_loc[ish];
+            dm_kl = dms[component_kl] + local_ao_loc[lsh]*(size_t)nao_kl + local_ao_loc[ksh];
+        }
         int expk = bas[ksh*BAS_SLOTS+PTR_EXP];
         int expl = bas[lsh*BAS_SLOTS+PTR_EXP];
         int ck = bas[ksh*BAS_SLOTS+PTR_COEFF];
@@ -7303,25 +7561,47 @@ while (1) {
                 dd_cache17 += fac * (dm[(j0+0)*nao+(k0+2)] * dm[(l0+0)*nao+(i0+5)] + dm[(j0+0)*nao+(l0+0)] * dm[(k0+2)*nao+(i0+5)]);
             }
             if (jk.j_factor != 0) {
-                double fac = fac_sym * jk.j_factor;
-                dd_cache0 += fac * dm[(l0+0)*nao+(k0+0)] * dm[(j0+0)*nao+(i0+0)];
-                dd_cache1 += fac * dm[(l0+0)*nao+(k0+0)] * dm[(j0+0)*nao+(i0+1)];
-                dd_cache2 += fac * dm[(l0+0)*nao+(k0+0)] * dm[(j0+0)*nao+(i0+2)];
-                dd_cache3 += fac * dm[(l0+0)*nao+(k0+0)] * dm[(j0+0)*nao+(i0+3)];
-                dd_cache4 += fac * dm[(l0+0)*nao+(k0+0)] * dm[(j0+0)*nao+(i0+4)];
-                dd_cache5 += fac * dm[(l0+0)*nao+(k0+0)] * dm[(j0+0)*nao+(i0+5)];
-                dd_cache6 += fac * dm[(l0+0)*nao+(k0+1)] * dm[(j0+0)*nao+(i0+0)];
-                dd_cache7 += fac * dm[(l0+0)*nao+(k0+1)] * dm[(j0+0)*nao+(i0+1)];
-                dd_cache8 += fac * dm[(l0+0)*nao+(k0+1)] * dm[(j0+0)*nao+(i0+2)];
-                dd_cache9 += fac * dm[(l0+0)*nao+(k0+1)] * dm[(j0+0)*nao+(i0+3)];
-                dd_cache10 += fac * dm[(l0+0)*nao+(k0+1)] * dm[(j0+0)*nao+(i0+4)];
-                dd_cache11 += fac * dm[(l0+0)*nao+(k0+1)] * dm[(j0+0)*nao+(i0+5)];
-                dd_cache12 += fac * dm[(l0+0)*nao+(k0+2)] * dm[(j0+0)*nao+(i0+0)];
-                dd_cache13 += fac * dm[(l0+0)*nao+(k0+2)] * dm[(j0+0)*nao+(i0+1)];
-                dd_cache14 += fac * dm[(l0+0)*nao+(k0+2)] * dm[(j0+0)*nao+(i0+2)];
-                dd_cache15 += fac * dm[(l0+0)*nao+(k0+2)] * dm[(j0+0)*nao+(i0+3)];
-                dd_cache16 += fac * dm[(l0+0)*nao+(k0+2)] * dm[(j0+0)*nao+(i0+4)];
-                dd_cache17 += fac * dm[(l0+0)*nao+(k0+2)] * dm[(j0+0)*nao+(i0+5)];
+                if (multi_in) {
+                    double fac = fac_sym * jk.j_factor;
+                    dd_cache0 += fac * dm_kl[(0)*nao_kl+(0)] * dm_ij[(0)*nao_ij+(0)];
+                    dd_cache1 += fac * dm_kl[(0)*nao_kl+(0)] * dm_ij[(0)*nao_ij+(1)];
+                    dd_cache2 += fac * dm_kl[(0)*nao_kl+(0)] * dm_ij[(0)*nao_ij+(2)];
+                    dd_cache3 += fac * dm_kl[(0)*nao_kl+(0)] * dm_ij[(0)*nao_ij+(3)];
+                    dd_cache4 += fac * dm_kl[(0)*nao_kl+(0)] * dm_ij[(0)*nao_ij+(4)];
+                    dd_cache5 += fac * dm_kl[(0)*nao_kl+(0)] * dm_ij[(0)*nao_ij+(5)];
+                    dd_cache6 += fac * dm_kl[(0)*nao_kl+(1)] * dm_ij[(0)*nao_ij+(0)];
+                    dd_cache7 += fac * dm_kl[(0)*nao_kl+(1)] * dm_ij[(0)*nao_ij+(1)];
+                    dd_cache8 += fac * dm_kl[(0)*nao_kl+(1)] * dm_ij[(0)*nao_ij+(2)];
+                    dd_cache9 += fac * dm_kl[(0)*nao_kl+(1)] * dm_ij[(0)*nao_ij+(3)];
+                    dd_cache10 += fac * dm_kl[(0)*nao_kl+(1)] * dm_ij[(0)*nao_ij+(4)];
+                    dd_cache11 += fac * dm_kl[(0)*nao_kl+(1)] * dm_ij[(0)*nao_ij+(5)];
+                    dd_cache12 += fac * dm_kl[(0)*nao_kl+(2)] * dm_ij[(0)*nao_ij+(0)];
+                    dd_cache13 += fac * dm_kl[(0)*nao_kl+(2)] * dm_ij[(0)*nao_ij+(1)];
+                    dd_cache14 += fac * dm_kl[(0)*nao_kl+(2)] * dm_ij[(0)*nao_ij+(2)];
+                    dd_cache15 += fac * dm_kl[(0)*nao_kl+(2)] * dm_ij[(0)*nao_ij+(3)];
+                    dd_cache16 += fac * dm_kl[(0)*nao_kl+(2)] * dm_ij[(0)*nao_ij+(4)];
+                    dd_cache17 += fac * dm_kl[(0)*nao_kl+(2)] * dm_ij[(0)*nao_ij+(5)];
+                } else {
+                    double fac = fac_sym * jk.j_factor;
+                    dd_cache0 += fac * dm[(l0+0)*nao+(k0+0)] * dm[(j0+0)*nao+(i0+0)];
+                    dd_cache1 += fac * dm[(l0+0)*nao+(k0+0)] * dm[(j0+0)*nao+(i0+1)];
+                    dd_cache2 += fac * dm[(l0+0)*nao+(k0+0)] * dm[(j0+0)*nao+(i0+2)];
+                    dd_cache3 += fac * dm[(l0+0)*nao+(k0+0)] * dm[(j0+0)*nao+(i0+3)];
+                    dd_cache4 += fac * dm[(l0+0)*nao+(k0+0)] * dm[(j0+0)*nao+(i0+4)];
+                    dd_cache5 += fac * dm[(l0+0)*nao+(k0+0)] * dm[(j0+0)*nao+(i0+5)];
+                    dd_cache6 += fac * dm[(l0+0)*nao+(k0+1)] * dm[(j0+0)*nao+(i0+0)];
+                    dd_cache7 += fac * dm[(l0+0)*nao+(k0+1)] * dm[(j0+0)*nao+(i0+1)];
+                    dd_cache8 += fac * dm[(l0+0)*nao+(k0+1)] * dm[(j0+0)*nao+(i0+2)];
+                    dd_cache9 += fac * dm[(l0+0)*nao+(k0+1)] * dm[(j0+0)*nao+(i0+3)];
+                    dd_cache10 += fac * dm[(l0+0)*nao+(k0+1)] * dm[(j0+0)*nao+(i0+4)];
+                    dd_cache11 += fac * dm[(l0+0)*nao+(k0+1)] * dm[(j0+0)*nao+(i0+5)];
+                    dd_cache12 += fac * dm[(l0+0)*nao+(k0+2)] * dm[(j0+0)*nao+(i0+0)];
+                    dd_cache13 += fac * dm[(l0+0)*nao+(k0+2)] * dm[(j0+0)*nao+(i0+1)];
+                    dd_cache14 += fac * dm[(l0+0)*nao+(k0+2)] * dm[(j0+0)*nao+(i0+2)];
+                    dd_cache15 += fac * dm[(l0+0)*nao+(k0+2)] * dm[(j0+0)*nao+(i0+3)];
+                    dd_cache16 += fac * dm[(l0+0)*nao+(k0+2)] * dm[(j0+0)*nao+(i0+4)];
+                    dd_cache17 += fac * dm[(l0+0)*nao+(k0+2)] * dm[(j0+0)*nao+(i0+5)];
+                }
             }
         } else {
             double *dmb = dm + nao * nao;
@@ -8125,8 +8405,9 @@ while (1) {
 }
 }
 
+template <bool multi_in, bool exclude_component_self>
 __global__ static
-void rys_ejk_ip1_2011(JKENERGY_KERNEL_ARGS)
+void rys_ejk_ip1_2011(JKENERGY_MULTI_KERNEL_ARGS)
 {
     JKENERGY_KERNEL_SETUP();
     constexpr int nsq_per_block = 64;
@@ -8167,12 +8448,14 @@ while (1) {
     if (jk.omega >= 0) {
         _fill_ejk_tasks(ntasks, pair_kl0, bas_kl_idx, pair_ij, ish, jsh,
                         q_cond_ij, q_cond_kl,
-                        (int *)shared_memory, jk, envs, bounds);
+                        (int *)shared_memory, jk, envs, bounds,
+                        component_id, exclude_component_self);
     } else {
         _fill_sr_ejk_tasks(ntasks, pair_kl0, bas_kl_idx, pair_ij, ish, jsh,
                            q_cond_ij, q_cond_kl,
                            s_cond_ij, s_cond_kl, diffuse_exps,
-                           (int *)shared_memory, jk, envs, bounds);
+                           (int *)shared_memory, jk, envs, bounds,
+                        component_id, exclude_component_self);
     }
     if (ntasks == 0) {
         continue;
@@ -8232,6 +8515,18 @@ while (1) {
         int j0 = ao_loc[jsh];
         int k0 = ao_loc[ksh];
         int l0 = ao_loc[lsh];
+        double *dm_ij;
+        double *dm_kl;
+        int nao_ij;
+        int nao_kl;
+        if (multi_in) {
+            int component_ij = component_id[ish];
+            int component_kl = component_id[ksh];
+            nao_ij = component_nao[component_ij];
+            nao_kl = component_nao[component_kl];
+            dm_ij = dms[component_ij] + local_ao_loc[jsh]*(size_t)nao_ij + local_ao_loc[ish];
+            dm_kl = dms[component_kl] + local_ao_loc[lsh]*(size_t)nao_kl + local_ao_loc[ksh];
+        }
         int expk = bas[ksh*BAS_SLOTS+PTR_EXP];
         int expl = bas[lsh*BAS_SLOTS+PTR_EXP];
         int ck = bas[ksh*BAS_SLOTS+PTR_COEFF];
@@ -8282,7 +8577,11 @@ while (1) {
                     dd += jk.k_factor * (dm[_jk] * dm[_li] + dm[_jl] * dm[_ki]);
                 }
                 if (do_j) {
-                    dd += jk.j_factor * dm[_ji] * dm[_lk];
+                    if (multi_in) {
+                        dd += jk.j_factor * dm_ij[j*nao_ij+i] * dm_kl[l*nao_kl+k];
+                    } else {
+                        dd += jk.j_factor * dm[_ji] * dm[_lk];
+                    }
                 }
                 dd_cache[n*64] = fac_sym * dd;
             }
@@ -9548,8 +9847,9 @@ while (1) {
 }
 }
 
+template <bool multi_in, bool exclude_component_self>
 __global__ static
-void rys_ejk_ip1_2020(JKENERGY_KERNEL_ARGS)
+void rys_ejk_ip1_2020(JKENERGY_MULTI_KERNEL_ARGS)
 {
     JKENERGY_KERNEL_SETUP();
     constexpr int nsq_per_block = 256;
@@ -9586,12 +9886,14 @@ while (1) {
     if (jk.omega >= 0) {
         _fill_ejk_tasks(ntasks, pair_kl0, bas_kl_idx, pair_ij, ish, jsh,
                         q_cond_ij, q_cond_kl,
-                        (int *)shared_memory, jk, envs, bounds);
+                        (int *)shared_memory, jk, envs, bounds,
+                        component_id, exclude_component_self);
     } else {
         _fill_sr_ejk_tasks(ntasks, pair_kl0, bas_kl_idx, pair_ij, ish, jsh,
                            q_cond_ij, q_cond_kl,
                            s_cond_ij, s_cond_kl, diffuse_exps,
-                           (int *)shared_memory, jk, envs, bounds);
+                           (int *)shared_memory, jk, envs, bounds,
+                        component_id, exclude_component_self);
     }
     if (ntasks == 0) {
         continue;
@@ -9651,6 +9953,18 @@ while (1) {
         int j0 = ao_loc[jsh];
         int k0 = ao_loc[ksh];
         int l0 = ao_loc[lsh];
+        double *dm_ij;
+        double *dm_kl;
+        int nao_ij;
+        int nao_kl;
+        if (multi_in) {
+            int component_ij = component_id[ish];
+            int component_kl = component_id[ksh];
+            nao_ij = component_nao[component_ij];
+            nao_kl = component_nao[component_kl];
+            dm_ij = dms[component_ij] + local_ao_loc[jsh]*(size_t)nao_ij + local_ao_loc[ish];
+            dm_kl = dms[component_kl] + local_ao_loc[lsh]*(size_t)nao_kl + local_ao_loc[ksh];
+        }
         int expk = bas[ksh*BAS_SLOTS+PTR_EXP];
         int expl = bas[lsh*BAS_SLOTS+PTR_EXP];
         int ck = bas[ksh*BAS_SLOTS+PTR_COEFF];
@@ -9752,43 +10066,83 @@ while (1) {
                 dd_cache35 += fac * (dm[(j0+0)*nao+(k0+5)] * dm[(l0+0)*nao+(i0+5)] + dm[(j0+0)*nao+(l0+0)] * dm[(k0+5)*nao+(i0+5)]);
             }
             if (jk.j_factor != 0) {
-                double fac = fac_sym * jk.j_factor;
-                dd_cache0 += fac * dm[(l0+0)*nao+(k0+0)] * dm[(j0+0)*nao+(i0+0)];
-                dd_cache1 += fac * dm[(l0+0)*nao+(k0+0)] * dm[(j0+0)*nao+(i0+1)];
-                dd_cache2 += fac * dm[(l0+0)*nao+(k0+0)] * dm[(j0+0)*nao+(i0+2)];
-                dd_cache3 += fac * dm[(l0+0)*nao+(k0+0)] * dm[(j0+0)*nao+(i0+3)];
-                dd_cache4 += fac * dm[(l0+0)*nao+(k0+0)] * dm[(j0+0)*nao+(i0+4)];
-                dd_cache5 += fac * dm[(l0+0)*nao+(k0+0)] * dm[(j0+0)*nao+(i0+5)];
-                dd_cache6 += fac * dm[(l0+0)*nao+(k0+1)] * dm[(j0+0)*nao+(i0+0)];
-                dd_cache7 += fac * dm[(l0+0)*nao+(k0+1)] * dm[(j0+0)*nao+(i0+1)];
-                dd_cache8 += fac * dm[(l0+0)*nao+(k0+1)] * dm[(j0+0)*nao+(i0+2)];
-                dd_cache9 += fac * dm[(l0+0)*nao+(k0+1)] * dm[(j0+0)*nao+(i0+3)];
-                dd_cache10 += fac * dm[(l0+0)*nao+(k0+1)] * dm[(j0+0)*nao+(i0+4)];
-                dd_cache11 += fac * dm[(l0+0)*nao+(k0+1)] * dm[(j0+0)*nao+(i0+5)];
-                dd_cache12 += fac * dm[(l0+0)*nao+(k0+2)] * dm[(j0+0)*nao+(i0+0)];
-                dd_cache13 += fac * dm[(l0+0)*nao+(k0+2)] * dm[(j0+0)*nao+(i0+1)];
-                dd_cache14 += fac * dm[(l0+0)*nao+(k0+2)] * dm[(j0+0)*nao+(i0+2)];
-                dd_cache15 += fac * dm[(l0+0)*nao+(k0+2)] * dm[(j0+0)*nao+(i0+3)];
-                dd_cache16 += fac * dm[(l0+0)*nao+(k0+2)] * dm[(j0+0)*nao+(i0+4)];
-                dd_cache17 += fac * dm[(l0+0)*nao+(k0+2)] * dm[(j0+0)*nao+(i0+5)];
-                dd_cache18 += fac * dm[(l0+0)*nao+(k0+3)] * dm[(j0+0)*nao+(i0+0)];
-                dd_cache19 += fac * dm[(l0+0)*nao+(k0+3)] * dm[(j0+0)*nao+(i0+1)];
-                dd_cache20 += fac * dm[(l0+0)*nao+(k0+3)] * dm[(j0+0)*nao+(i0+2)];
-                dd_cache21 += fac * dm[(l0+0)*nao+(k0+3)] * dm[(j0+0)*nao+(i0+3)];
-                dd_cache22 += fac * dm[(l0+0)*nao+(k0+3)] * dm[(j0+0)*nao+(i0+4)];
-                dd_cache23 += fac * dm[(l0+0)*nao+(k0+3)] * dm[(j0+0)*nao+(i0+5)];
-                dd_cache24 += fac * dm[(l0+0)*nao+(k0+4)] * dm[(j0+0)*nao+(i0+0)];
-                dd_cache25 += fac * dm[(l0+0)*nao+(k0+4)] * dm[(j0+0)*nao+(i0+1)];
-                dd_cache26 += fac * dm[(l0+0)*nao+(k0+4)] * dm[(j0+0)*nao+(i0+2)];
-                dd_cache27 += fac * dm[(l0+0)*nao+(k0+4)] * dm[(j0+0)*nao+(i0+3)];
-                dd_cache28 += fac * dm[(l0+0)*nao+(k0+4)] * dm[(j0+0)*nao+(i0+4)];
-                dd_cache29 += fac * dm[(l0+0)*nao+(k0+4)] * dm[(j0+0)*nao+(i0+5)];
-                dd_cache30 += fac * dm[(l0+0)*nao+(k0+5)] * dm[(j0+0)*nao+(i0+0)];
-                dd_cache31 += fac * dm[(l0+0)*nao+(k0+5)] * dm[(j0+0)*nao+(i0+1)];
-                dd_cache32 += fac * dm[(l0+0)*nao+(k0+5)] * dm[(j0+0)*nao+(i0+2)];
-                dd_cache33 += fac * dm[(l0+0)*nao+(k0+5)] * dm[(j0+0)*nao+(i0+3)];
-                dd_cache34 += fac * dm[(l0+0)*nao+(k0+5)] * dm[(j0+0)*nao+(i0+4)];
-                dd_cache35 += fac * dm[(l0+0)*nao+(k0+5)] * dm[(j0+0)*nao+(i0+5)];
+                if (multi_in) {
+                    double fac = fac_sym * jk.j_factor;
+                    dd_cache0 += fac * dm_kl[(0)*nao_kl+(0)] * dm_ij[(0)*nao_ij+(0)];
+                    dd_cache1 += fac * dm_kl[(0)*nao_kl+(0)] * dm_ij[(0)*nao_ij+(1)];
+                    dd_cache2 += fac * dm_kl[(0)*nao_kl+(0)] * dm_ij[(0)*nao_ij+(2)];
+                    dd_cache3 += fac * dm_kl[(0)*nao_kl+(0)] * dm_ij[(0)*nao_ij+(3)];
+                    dd_cache4 += fac * dm_kl[(0)*nao_kl+(0)] * dm_ij[(0)*nao_ij+(4)];
+                    dd_cache5 += fac * dm_kl[(0)*nao_kl+(0)] * dm_ij[(0)*nao_ij+(5)];
+                    dd_cache6 += fac * dm_kl[(0)*nao_kl+(1)] * dm_ij[(0)*nao_ij+(0)];
+                    dd_cache7 += fac * dm_kl[(0)*nao_kl+(1)] * dm_ij[(0)*nao_ij+(1)];
+                    dd_cache8 += fac * dm_kl[(0)*nao_kl+(1)] * dm_ij[(0)*nao_ij+(2)];
+                    dd_cache9 += fac * dm_kl[(0)*nao_kl+(1)] * dm_ij[(0)*nao_ij+(3)];
+                    dd_cache10 += fac * dm_kl[(0)*nao_kl+(1)] * dm_ij[(0)*nao_ij+(4)];
+                    dd_cache11 += fac * dm_kl[(0)*nao_kl+(1)] * dm_ij[(0)*nao_ij+(5)];
+                    dd_cache12 += fac * dm_kl[(0)*nao_kl+(2)] * dm_ij[(0)*nao_ij+(0)];
+                    dd_cache13 += fac * dm_kl[(0)*nao_kl+(2)] * dm_ij[(0)*nao_ij+(1)];
+                    dd_cache14 += fac * dm_kl[(0)*nao_kl+(2)] * dm_ij[(0)*nao_ij+(2)];
+                    dd_cache15 += fac * dm_kl[(0)*nao_kl+(2)] * dm_ij[(0)*nao_ij+(3)];
+                    dd_cache16 += fac * dm_kl[(0)*nao_kl+(2)] * dm_ij[(0)*nao_ij+(4)];
+                    dd_cache17 += fac * dm_kl[(0)*nao_kl+(2)] * dm_ij[(0)*nao_ij+(5)];
+                    dd_cache18 += fac * dm_kl[(0)*nao_kl+(3)] * dm_ij[(0)*nao_ij+(0)];
+                    dd_cache19 += fac * dm_kl[(0)*nao_kl+(3)] * dm_ij[(0)*nao_ij+(1)];
+                    dd_cache20 += fac * dm_kl[(0)*nao_kl+(3)] * dm_ij[(0)*nao_ij+(2)];
+                    dd_cache21 += fac * dm_kl[(0)*nao_kl+(3)] * dm_ij[(0)*nao_ij+(3)];
+                    dd_cache22 += fac * dm_kl[(0)*nao_kl+(3)] * dm_ij[(0)*nao_ij+(4)];
+                    dd_cache23 += fac * dm_kl[(0)*nao_kl+(3)] * dm_ij[(0)*nao_ij+(5)];
+                    dd_cache24 += fac * dm_kl[(0)*nao_kl+(4)] * dm_ij[(0)*nao_ij+(0)];
+                    dd_cache25 += fac * dm_kl[(0)*nao_kl+(4)] * dm_ij[(0)*nao_ij+(1)];
+                    dd_cache26 += fac * dm_kl[(0)*nao_kl+(4)] * dm_ij[(0)*nao_ij+(2)];
+                    dd_cache27 += fac * dm_kl[(0)*nao_kl+(4)] * dm_ij[(0)*nao_ij+(3)];
+                    dd_cache28 += fac * dm_kl[(0)*nao_kl+(4)] * dm_ij[(0)*nao_ij+(4)];
+                    dd_cache29 += fac * dm_kl[(0)*nao_kl+(4)] * dm_ij[(0)*nao_ij+(5)];
+                    dd_cache30 += fac * dm_kl[(0)*nao_kl+(5)] * dm_ij[(0)*nao_ij+(0)];
+                    dd_cache31 += fac * dm_kl[(0)*nao_kl+(5)] * dm_ij[(0)*nao_ij+(1)];
+                    dd_cache32 += fac * dm_kl[(0)*nao_kl+(5)] * dm_ij[(0)*nao_ij+(2)];
+                    dd_cache33 += fac * dm_kl[(0)*nao_kl+(5)] * dm_ij[(0)*nao_ij+(3)];
+                    dd_cache34 += fac * dm_kl[(0)*nao_kl+(5)] * dm_ij[(0)*nao_ij+(4)];
+                    dd_cache35 += fac * dm_kl[(0)*nao_kl+(5)] * dm_ij[(0)*nao_ij+(5)];
+                } else {
+                    double fac = fac_sym * jk.j_factor;
+                    dd_cache0 += fac * dm[(l0+0)*nao+(k0+0)] * dm[(j0+0)*nao+(i0+0)];
+                    dd_cache1 += fac * dm[(l0+0)*nao+(k0+0)] * dm[(j0+0)*nao+(i0+1)];
+                    dd_cache2 += fac * dm[(l0+0)*nao+(k0+0)] * dm[(j0+0)*nao+(i0+2)];
+                    dd_cache3 += fac * dm[(l0+0)*nao+(k0+0)] * dm[(j0+0)*nao+(i0+3)];
+                    dd_cache4 += fac * dm[(l0+0)*nao+(k0+0)] * dm[(j0+0)*nao+(i0+4)];
+                    dd_cache5 += fac * dm[(l0+0)*nao+(k0+0)] * dm[(j0+0)*nao+(i0+5)];
+                    dd_cache6 += fac * dm[(l0+0)*nao+(k0+1)] * dm[(j0+0)*nao+(i0+0)];
+                    dd_cache7 += fac * dm[(l0+0)*nao+(k0+1)] * dm[(j0+0)*nao+(i0+1)];
+                    dd_cache8 += fac * dm[(l0+0)*nao+(k0+1)] * dm[(j0+0)*nao+(i0+2)];
+                    dd_cache9 += fac * dm[(l0+0)*nao+(k0+1)] * dm[(j0+0)*nao+(i0+3)];
+                    dd_cache10 += fac * dm[(l0+0)*nao+(k0+1)] * dm[(j0+0)*nao+(i0+4)];
+                    dd_cache11 += fac * dm[(l0+0)*nao+(k0+1)] * dm[(j0+0)*nao+(i0+5)];
+                    dd_cache12 += fac * dm[(l0+0)*nao+(k0+2)] * dm[(j0+0)*nao+(i0+0)];
+                    dd_cache13 += fac * dm[(l0+0)*nao+(k0+2)] * dm[(j0+0)*nao+(i0+1)];
+                    dd_cache14 += fac * dm[(l0+0)*nao+(k0+2)] * dm[(j0+0)*nao+(i0+2)];
+                    dd_cache15 += fac * dm[(l0+0)*nao+(k0+2)] * dm[(j0+0)*nao+(i0+3)];
+                    dd_cache16 += fac * dm[(l0+0)*nao+(k0+2)] * dm[(j0+0)*nao+(i0+4)];
+                    dd_cache17 += fac * dm[(l0+0)*nao+(k0+2)] * dm[(j0+0)*nao+(i0+5)];
+                    dd_cache18 += fac * dm[(l0+0)*nao+(k0+3)] * dm[(j0+0)*nao+(i0+0)];
+                    dd_cache19 += fac * dm[(l0+0)*nao+(k0+3)] * dm[(j0+0)*nao+(i0+1)];
+                    dd_cache20 += fac * dm[(l0+0)*nao+(k0+3)] * dm[(j0+0)*nao+(i0+2)];
+                    dd_cache21 += fac * dm[(l0+0)*nao+(k0+3)] * dm[(j0+0)*nao+(i0+3)];
+                    dd_cache22 += fac * dm[(l0+0)*nao+(k0+3)] * dm[(j0+0)*nao+(i0+4)];
+                    dd_cache23 += fac * dm[(l0+0)*nao+(k0+3)] * dm[(j0+0)*nao+(i0+5)];
+                    dd_cache24 += fac * dm[(l0+0)*nao+(k0+4)] * dm[(j0+0)*nao+(i0+0)];
+                    dd_cache25 += fac * dm[(l0+0)*nao+(k0+4)] * dm[(j0+0)*nao+(i0+1)];
+                    dd_cache26 += fac * dm[(l0+0)*nao+(k0+4)] * dm[(j0+0)*nao+(i0+2)];
+                    dd_cache27 += fac * dm[(l0+0)*nao+(k0+4)] * dm[(j0+0)*nao+(i0+3)];
+                    dd_cache28 += fac * dm[(l0+0)*nao+(k0+4)] * dm[(j0+0)*nao+(i0+4)];
+                    dd_cache29 += fac * dm[(l0+0)*nao+(k0+4)] * dm[(j0+0)*nao+(i0+5)];
+                    dd_cache30 += fac * dm[(l0+0)*nao+(k0+5)] * dm[(j0+0)*nao+(i0+0)];
+                    dd_cache31 += fac * dm[(l0+0)*nao+(k0+5)] * dm[(j0+0)*nao+(i0+1)];
+                    dd_cache32 += fac * dm[(l0+0)*nao+(k0+5)] * dm[(j0+0)*nao+(i0+2)];
+                    dd_cache33 += fac * dm[(l0+0)*nao+(k0+5)] * dm[(j0+0)*nao+(i0+3)];
+                    dd_cache34 += fac * dm[(l0+0)*nao+(k0+5)] * dm[(j0+0)*nao+(i0+4)];
+                    dd_cache35 += fac * dm[(l0+0)*nao+(k0+5)] * dm[(j0+0)*nao+(i0+5)];
+                }
             }
         } else {
             double *dmb = dm + nao * nao;
@@ -11279,8 +11633,9 @@ while (1) {
 }
 }
 
+template <bool multi_in, bool exclude_component_self>
 __global__ static
-void rys_ejk_ip1_2021(JKENERGY_KERNEL_ARGS)
+void rys_ejk_ip1_2021(JKENERGY_MULTI_KERNEL_ARGS)
 {
     JKENERGY_KERNEL_SETUP();
     constexpr int nsq_per_block = 32;
@@ -11321,12 +11676,14 @@ while (1) {
     if (jk.omega >= 0) {
         _fill_ejk_tasks(ntasks, pair_kl0, bas_kl_idx, pair_ij, ish, jsh,
                         q_cond_ij, q_cond_kl,
-                        (int *)shared_memory, jk, envs, bounds);
+                        (int *)shared_memory, jk, envs, bounds,
+                        component_id, exclude_component_self);
     } else {
         _fill_sr_ejk_tasks(ntasks, pair_kl0, bas_kl_idx, pair_ij, ish, jsh,
                            q_cond_ij, q_cond_kl,
                            s_cond_ij, s_cond_kl, diffuse_exps,
-                           (int *)shared_memory, jk, envs, bounds);
+                           (int *)shared_memory, jk, envs, bounds,
+                        component_id, exclude_component_self);
     }
     if (ntasks == 0) {
         continue;
@@ -11386,6 +11743,18 @@ while (1) {
         int j0 = ao_loc[jsh];
         int k0 = ao_loc[ksh];
         int l0 = ao_loc[lsh];
+        double *dm_ij;
+        double *dm_kl;
+        int nao_ij;
+        int nao_kl;
+        if (multi_in) {
+            int component_ij = component_id[ish];
+            int component_kl = component_id[ksh];
+            nao_ij = component_nao[component_ij];
+            nao_kl = component_nao[component_kl];
+            dm_ij = dms[component_ij] + local_ao_loc[jsh]*(size_t)nao_ij + local_ao_loc[ish];
+            dm_kl = dms[component_kl] + local_ao_loc[lsh]*(size_t)nao_kl + local_ao_loc[ksh];
+        }
         int expk = bas[ksh*BAS_SLOTS+PTR_EXP];
         int expl = bas[lsh*BAS_SLOTS+PTR_EXP];
         int ck = bas[ksh*BAS_SLOTS+PTR_COEFF];
@@ -11436,7 +11805,11 @@ while (1) {
                     dd += jk.k_factor * (dm[_jk] * dm[_li] + dm[_jl] * dm[_ki]);
                 }
                 if (do_j) {
-                    dd += jk.j_factor * dm[_ji] * dm[_lk];
+                    if (multi_in) {
+                        dd += jk.j_factor * dm_ij[j*nao_ij+i] * dm_kl[l*nao_kl+k];
+                    } else {
+                        dd += jk.j_factor * dm[_ji] * dm[_lk];
+                    }
                 }
                 dd_cache[n*32] = fac_sym * dd;
             }
@@ -13767,8 +14140,9 @@ while (1) {
 }
 }
 
+template <bool multi_in, bool exclude_component_self>
 __global__ static
-void rys_ejk_ip1_2100(JKENERGY_KERNEL_ARGS)
+void rys_ejk_ip1_2100(JKENERGY_MULTI_KERNEL_ARGS)
 {
     JKENERGY_KERNEL_SETUP();
     constexpr int nsq_per_block = 256;
@@ -13805,12 +14179,14 @@ while (1) {
     if (jk.omega >= 0) {
         _fill_ejk_tasks(ntasks, pair_kl0, bas_kl_idx, pair_ij, ish, jsh,
                         q_cond_ij, q_cond_kl,
-                        (int *)shared_memory, jk, envs, bounds);
+                        (int *)shared_memory, jk, envs, bounds,
+                        component_id, exclude_component_self);
     } else {
         _fill_sr_ejk_tasks(ntasks, pair_kl0, bas_kl_idx, pair_ij, ish, jsh,
                            q_cond_ij, q_cond_kl,
                            s_cond_ij, s_cond_kl, diffuse_exps,
-                           (int *)shared_memory, jk, envs, bounds);
+                           (int *)shared_memory, jk, envs, bounds,
+                        component_id, exclude_component_self);
     }
     if (ntasks == 0) {
         continue;
@@ -13870,6 +14246,18 @@ while (1) {
         int j0 = ao_loc[jsh];
         int k0 = ao_loc[ksh];
         int l0 = ao_loc[lsh];
+        double *dm_ij;
+        double *dm_kl;
+        int nao_ij;
+        int nao_kl;
+        if (multi_in) {
+            int component_ij = component_id[ish];
+            int component_kl = component_id[ksh];
+            nao_ij = component_nao[component_ij];
+            nao_kl = component_nao[component_kl];
+            dm_ij = dms[component_ij] + local_ao_loc[jsh]*(size_t)nao_ij + local_ao_loc[ish];
+            dm_kl = dms[component_kl] + local_ao_loc[lsh]*(size_t)nao_kl + local_ao_loc[ksh];
+        }
         int expk = bas[ksh*BAS_SLOTS+PTR_EXP];
         int expl = bas[lsh*BAS_SLOTS+PTR_EXP];
         int ck = bas[ksh*BAS_SLOTS+PTR_COEFF];
@@ -13935,25 +14323,47 @@ while (1) {
                 dd_cache17 += fac * (dm[(j0+2)*nao+(k0+0)] * dm[(l0+0)*nao+(i0+5)] + dm[(j0+2)*nao+(l0+0)] * dm[(k0+0)*nao+(i0+5)]);
             }
             if (jk.j_factor != 0) {
-                double fac = fac_sym * jk.j_factor;
-                dd_cache0 += fac * dm[(l0+0)*nao+(k0+0)] * dm[(j0+0)*nao+(i0+0)];
-                dd_cache1 += fac * dm[(l0+0)*nao+(k0+0)] * dm[(j0+0)*nao+(i0+1)];
-                dd_cache2 += fac * dm[(l0+0)*nao+(k0+0)] * dm[(j0+0)*nao+(i0+2)];
-                dd_cache3 += fac * dm[(l0+0)*nao+(k0+0)] * dm[(j0+0)*nao+(i0+3)];
-                dd_cache4 += fac * dm[(l0+0)*nao+(k0+0)] * dm[(j0+0)*nao+(i0+4)];
-                dd_cache5 += fac * dm[(l0+0)*nao+(k0+0)] * dm[(j0+0)*nao+(i0+5)];
-                dd_cache6 += fac * dm[(l0+0)*nao+(k0+0)] * dm[(j0+1)*nao+(i0+0)];
-                dd_cache7 += fac * dm[(l0+0)*nao+(k0+0)] * dm[(j0+1)*nao+(i0+1)];
-                dd_cache8 += fac * dm[(l0+0)*nao+(k0+0)] * dm[(j0+1)*nao+(i0+2)];
-                dd_cache9 += fac * dm[(l0+0)*nao+(k0+0)] * dm[(j0+1)*nao+(i0+3)];
-                dd_cache10 += fac * dm[(l0+0)*nao+(k0+0)] * dm[(j0+1)*nao+(i0+4)];
-                dd_cache11 += fac * dm[(l0+0)*nao+(k0+0)] * dm[(j0+1)*nao+(i0+5)];
-                dd_cache12 += fac * dm[(l0+0)*nao+(k0+0)] * dm[(j0+2)*nao+(i0+0)];
-                dd_cache13 += fac * dm[(l0+0)*nao+(k0+0)] * dm[(j0+2)*nao+(i0+1)];
-                dd_cache14 += fac * dm[(l0+0)*nao+(k0+0)] * dm[(j0+2)*nao+(i0+2)];
-                dd_cache15 += fac * dm[(l0+0)*nao+(k0+0)] * dm[(j0+2)*nao+(i0+3)];
-                dd_cache16 += fac * dm[(l0+0)*nao+(k0+0)] * dm[(j0+2)*nao+(i0+4)];
-                dd_cache17 += fac * dm[(l0+0)*nao+(k0+0)] * dm[(j0+2)*nao+(i0+5)];
+                if (multi_in) {
+                    double fac = fac_sym * jk.j_factor;
+                    dd_cache0 += fac * dm_kl[(0)*nao_kl+(0)] * dm_ij[(0)*nao_ij+(0)];
+                    dd_cache1 += fac * dm_kl[(0)*nao_kl+(0)] * dm_ij[(0)*nao_ij+(1)];
+                    dd_cache2 += fac * dm_kl[(0)*nao_kl+(0)] * dm_ij[(0)*nao_ij+(2)];
+                    dd_cache3 += fac * dm_kl[(0)*nao_kl+(0)] * dm_ij[(0)*nao_ij+(3)];
+                    dd_cache4 += fac * dm_kl[(0)*nao_kl+(0)] * dm_ij[(0)*nao_ij+(4)];
+                    dd_cache5 += fac * dm_kl[(0)*nao_kl+(0)] * dm_ij[(0)*nao_ij+(5)];
+                    dd_cache6 += fac * dm_kl[(0)*nao_kl+(0)] * dm_ij[(1)*nao_ij+(0)];
+                    dd_cache7 += fac * dm_kl[(0)*nao_kl+(0)] * dm_ij[(1)*nao_ij+(1)];
+                    dd_cache8 += fac * dm_kl[(0)*nao_kl+(0)] * dm_ij[(1)*nao_ij+(2)];
+                    dd_cache9 += fac * dm_kl[(0)*nao_kl+(0)] * dm_ij[(1)*nao_ij+(3)];
+                    dd_cache10 += fac * dm_kl[(0)*nao_kl+(0)] * dm_ij[(1)*nao_ij+(4)];
+                    dd_cache11 += fac * dm_kl[(0)*nao_kl+(0)] * dm_ij[(1)*nao_ij+(5)];
+                    dd_cache12 += fac * dm_kl[(0)*nao_kl+(0)] * dm_ij[(2)*nao_ij+(0)];
+                    dd_cache13 += fac * dm_kl[(0)*nao_kl+(0)] * dm_ij[(2)*nao_ij+(1)];
+                    dd_cache14 += fac * dm_kl[(0)*nao_kl+(0)] * dm_ij[(2)*nao_ij+(2)];
+                    dd_cache15 += fac * dm_kl[(0)*nao_kl+(0)] * dm_ij[(2)*nao_ij+(3)];
+                    dd_cache16 += fac * dm_kl[(0)*nao_kl+(0)] * dm_ij[(2)*nao_ij+(4)];
+                    dd_cache17 += fac * dm_kl[(0)*nao_kl+(0)] * dm_ij[(2)*nao_ij+(5)];
+                } else {
+                    double fac = fac_sym * jk.j_factor;
+                    dd_cache0 += fac * dm[(l0+0)*nao+(k0+0)] * dm[(j0+0)*nao+(i0+0)];
+                    dd_cache1 += fac * dm[(l0+0)*nao+(k0+0)] * dm[(j0+0)*nao+(i0+1)];
+                    dd_cache2 += fac * dm[(l0+0)*nao+(k0+0)] * dm[(j0+0)*nao+(i0+2)];
+                    dd_cache3 += fac * dm[(l0+0)*nao+(k0+0)] * dm[(j0+0)*nao+(i0+3)];
+                    dd_cache4 += fac * dm[(l0+0)*nao+(k0+0)] * dm[(j0+0)*nao+(i0+4)];
+                    dd_cache5 += fac * dm[(l0+0)*nao+(k0+0)] * dm[(j0+0)*nao+(i0+5)];
+                    dd_cache6 += fac * dm[(l0+0)*nao+(k0+0)] * dm[(j0+1)*nao+(i0+0)];
+                    dd_cache7 += fac * dm[(l0+0)*nao+(k0+0)] * dm[(j0+1)*nao+(i0+1)];
+                    dd_cache8 += fac * dm[(l0+0)*nao+(k0+0)] * dm[(j0+1)*nao+(i0+2)];
+                    dd_cache9 += fac * dm[(l0+0)*nao+(k0+0)] * dm[(j0+1)*nao+(i0+3)];
+                    dd_cache10 += fac * dm[(l0+0)*nao+(k0+0)] * dm[(j0+1)*nao+(i0+4)];
+                    dd_cache11 += fac * dm[(l0+0)*nao+(k0+0)] * dm[(j0+1)*nao+(i0+5)];
+                    dd_cache12 += fac * dm[(l0+0)*nao+(k0+0)] * dm[(j0+2)*nao+(i0+0)];
+                    dd_cache13 += fac * dm[(l0+0)*nao+(k0+0)] * dm[(j0+2)*nao+(i0+1)];
+                    dd_cache14 += fac * dm[(l0+0)*nao+(k0+0)] * dm[(j0+2)*nao+(i0+2)];
+                    dd_cache15 += fac * dm[(l0+0)*nao+(k0+0)] * dm[(j0+2)*nao+(i0+3)];
+                    dd_cache16 += fac * dm[(l0+0)*nao+(k0+0)] * dm[(j0+2)*nao+(i0+4)];
+                    dd_cache17 += fac * dm[(l0+0)*nao+(k0+0)] * dm[(j0+2)*nao+(i0+5)];
+                }
             }
         } else {
             double *dmb = dm + nao * nao;
@@ -14765,8 +15175,9 @@ while (1) {
 }
 }
 
+template <bool multi_in, bool exclude_component_self>
 __global__ static
-void rys_ejk_ip1_2110(JKENERGY_KERNEL_ARGS)
+void rys_ejk_ip1_2110(JKENERGY_MULTI_KERNEL_ARGS)
 {
     JKENERGY_KERNEL_SETUP();
     constexpr int nsq_per_block = 64;
@@ -14807,12 +15218,14 @@ while (1) {
     if (jk.omega >= 0) {
         _fill_ejk_tasks(ntasks, pair_kl0, bas_kl_idx, pair_ij, ish, jsh,
                         q_cond_ij, q_cond_kl,
-                        (int *)shared_memory, jk, envs, bounds);
+                        (int *)shared_memory, jk, envs, bounds,
+                        component_id, exclude_component_self);
     } else {
         _fill_sr_ejk_tasks(ntasks, pair_kl0, bas_kl_idx, pair_ij, ish, jsh,
                            q_cond_ij, q_cond_kl,
                            s_cond_ij, s_cond_kl, diffuse_exps,
-                           (int *)shared_memory, jk, envs, bounds);
+                           (int *)shared_memory, jk, envs, bounds,
+                        component_id, exclude_component_self);
     }
     if (ntasks == 0) {
         continue;
@@ -14872,6 +15285,18 @@ while (1) {
         int j0 = ao_loc[jsh];
         int k0 = ao_loc[ksh];
         int l0 = ao_loc[lsh];
+        double *dm_ij;
+        double *dm_kl;
+        int nao_ij;
+        int nao_kl;
+        if (multi_in) {
+            int component_ij = component_id[ish];
+            int component_kl = component_id[ksh];
+            nao_ij = component_nao[component_ij];
+            nao_kl = component_nao[component_kl];
+            dm_ij = dms[component_ij] + local_ao_loc[jsh]*(size_t)nao_ij + local_ao_loc[ish];
+            dm_kl = dms[component_kl] + local_ao_loc[lsh]*(size_t)nao_kl + local_ao_loc[ksh];
+        }
         int expk = bas[ksh*BAS_SLOTS+PTR_EXP];
         int expl = bas[lsh*BAS_SLOTS+PTR_EXP];
         int ck = bas[ksh*BAS_SLOTS+PTR_COEFF];
@@ -14922,7 +15347,11 @@ while (1) {
                     dd += jk.k_factor * (dm[_jk] * dm[_li] + dm[_jl] * dm[_ki]);
                 }
                 if (do_j) {
-                    dd += jk.j_factor * dm[_ji] * dm[_lk];
+                    if (multi_in) {
+                        dd += jk.j_factor * dm_ij[j*nao_ij+i] * dm_kl[l*nao_kl+k];
+                    } else {
+                        dd += jk.j_factor * dm[_ji] * dm[_lk];
+                    }
                 }
                 dd_cache[n*64] = fac_sym * dd;
             }
@@ -16180,8 +16609,9 @@ while (1) {
 }
 }
 
+template <bool multi_in, bool exclude_component_self>
 __global__ static
-void rys_ejk_ip1_2111(JKENERGY_KERNEL_ARGS)
+void rys_ejk_ip1_2111(JKENERGY_MULTI_KERNEL_ARGS)
 {
     JKENERGY_KERNEL_SETUP();
     constexpr int nsq_per_block = 32;
@@ -16222,12 +16652,14 @@ while (1) {
     if (jk.omega >= 0) {
         _fill_ejk_tasks(ntasks, pair_kl0, bas_kl_idx, pair_ij, ish, jsh,
                         q_cond_ij, q_cond_kl,
-                        (int *)shared_memory, jk, envs, bounds);
+                        (int *)shared_memory, jk, envs, bounds,
+                        component_id, exclude_component_self);
     } else {
         _fill_sr_ejk_tasks(ntasks, pair_kl0, bas_kl_idx, pair_ij, ish, jsh,
                            q_cond_ij, q_cond_kl,
                            s_cond_ij, s_cond_kl, diffuse_exps,
-                           (int *)shared_memory, jk, envs, bounds);
+                           (int *)shared_memory, jk, envs, bounds,
+                        component_id, exclude_component_self);
     }
     if (ntasks == 0) {
         continue;
@@ -16287,6 +16719,18 @@ while (1) {
         int j0 = ao_loc[jsh];
         int k0 = ao_loc[ksh];
         int l0 = ao_loc[lsh];
+        double *dm_ij;
+        double *dm_kl;
+        int nao_ij;
+        int nao_kl;
+        if (multi_in) {
+            int component_ij = component_id[ish];
+            int component_kl = component_id[ksh];
+            nao_ij = component_nao[component_ij];
+            nao_kl = component_nao[component_kl];
+            dm_ij = dms[component_ij] + local_ao_loc[jsh]*(size_t)nao_ij + local_ao_loc[ish];
+            dm_kl = dms[component_kl] + local_ao_loc[lsh]*(size_t)nao_kl + local_ao_loc[ksh];
+        }
         int expk = bas[ksh*BAS_SLOTS+PTR_EXP];
         int expl = bas[lsh*BAS_SLOTS+PTR_EXP];
         int ck = bas[ksh*BAS_SLOTS+PTR_COEFF];
@@ -16337,7 +16781,11 @@ while (1) {
                     dd += jk.k_factor * (dm[_jk] * dm[_li] + dm[_jl] * dm[_ki]);
                 }
                 if (do_j) {
-                    dd += jk.j_factor * dm[_ji] * dm[_lk];
+                    if (multi_in) {
+                        dd += jk.j_factor * dm_ij[j*nao_ij+i] * dm_kl[l*nao_kl+k];
+                    } else {
+                        dd += jk.j_factor * dm[_ji] * dm[_lk];
+                    }
                 }
                 dd_cache[n*32] = fac_sym * dd;
             }
@@ -19763,8 +20211,9 @@ while (1) {
 }
 }
 
+template <bool multi_in, bool exclude_component_self>
 __global__ static
-void rys_ejk_ip1_2120(JKENERGY_KERNEL_ARGS)
+void rys_ejk_ip1_2120(JKENERGY_MULTI_KERNEL_ARGS)
 {
     JKENERGY_KERNEL_SETUP();
     constexpr int nsq_per_block = 32;
@@ -19805,12 +20254,14 @@ while (1) {
     if (jk.omega >= 0) {
         _fill_ejk_tasks(ntasks, pair_kl0, bas_kl_idx, pair_ij, ish, jsh,
                         q_cond_ij, q_cond_kl,
-                        (int *)shared_memory, jk, envs, bounds);
+                        (int *)shared_memory, jk, envs, bounds,
+                        component_id, exclude_component_self);
     } else {
         _fill_sr_ejk_tasks(ntasks, pair_kl0, bas_kl_idx, pair_ij, ish, jsh,
                            q_cond_ij, q_cond_kl,
                            s_cond_ij, s_cond_kl, diffuse_exps,
-                           (int *)shared_memory, jk, envs, bounds);
+                           (int *)shared_memory, jk, envs, bounds,
+                        component_id, exclude_component_self);
     }
     if (ntasks == 0) {
         continue;
@@ -19870,6 +20321,18 @@ while (1) {
         int j0 = ao_loc[jsh];
         int k0 = ao_loc[ksh];
         int l0 = ao_loc[lsh];
+        double *dm_ij;
+        double *dm_kl;
+        int nao_ij;
+        int nao_kl;
+        if (multi_in) {
+            int component_ij = component_id[ish];
+            int component_kl = component_id[ksh];
+            nao_ij = component_nao[component_ij];
+            nao_kl = component_nao[component_kl];
+            dm_ij = dms[component_ij] + local_ao_loc[jsh]*(size_t)nao_ij + local_ao_loc[ish];
+            dm_kl = dms[component_kl] + local_ao_loc[lsh]*(size_t)nao_kl + local_ao_loc[ksh];
+        }
         int expk = bas[ksh*BAS_SLOTS+PTR_EXP];
         int expl = bas[lsh*BAS_SLOTS+PTR_EXP];
         int ck = bas[ksh*BAS_SLOTS+PTR_COEFF];
@@ -19920,7 +20383,11 @@ while (1) {
                     dd += jk.k_factor * (dm[_jk] * dm[_li] + dm[_jl] * dm[_ki]);
                 }
                 if (do_j) {
-                    dd += jk.j_factor * dm[_ji] * dm[_lk];
+                    if (multi_in) {
+                        dd += jk.j_factor * dm_ij[j*nao_ij+i] * dm_kl[l*nao_kl+k];
+                    } else {
+                        dd += jk.j_factor * dm[_ji] * dm[_lk];
+                    }
                 }
                 dd_cache[n*32] = fac_sym * dd;
             }
@@ -22248,8 +22715,9 @@ while (1) {
 }
 }
 
+template <bool multi_in, bool exclude_component_self>
 __global__ static
-void rys_ejk_ip1_2200(JKENERGY_KERNEL_ARGS)
+void rys_ejk_ip1_2200(JKENERGY_MULTI_KERNEL_ARGS)
 {
     JKENERGY_KERNEL_SETUP();
     constexpr int nsq_per_block = 256;
@@ -22286,12 +22754,14 @@ while (1) {
     if (jk.omega >= 0) {
         _fill_ejk_tasks(ntasks, pair_kl0, bas_kl_idx, pair_ij, ish, jsh,
                         q_cond_ij, q_cond_kl,
-                        (int *)shared_memory, jk, envs, bounds);
+                        (int *)shared_memory, jk, envs, bounds,
+                        component_id, exclude_component_self);
     } else {
         _fill_sr_ejk_tasks(ntasks, pair_kl0, bas_kl_idx, pair_ij, ish, jsh,
                            q_cond_ij, q_cond_kl,
                            s_cond_ij, s_cond_kl, diffuse_exps,
-                           (int *)shared_memory, jk, envs, bounds);
+                           (int *)shared_memory, jk, envs, bounds,
+                        component_id, exclude_component_self);
     }
     if (ntasks == 0) {
         continue;
@@ -22351,6 +22821,18 @@ while (1) {
         int j0 = ao_loc[jsh];
         int k0 = ao_loc[ksh];
         int l0 = ao_loc[lsh];
+        double *dm_ij;
+        double *dm_kl;
+        int nao_ij;
+        int nao_kl;
+        if (multi_in) {
+            int component_ij = component_id[ish];
+            int component_kl = component_id[ksh];
+            nao_ij = component_nao[component_ij];
+            nao_kl = component_nao[component_kl];
+            dm_ij = dms[component_ij] + local_ao_loc[jsh]*(size_t)nao_ij + local_ao_loc[ish];
+            dm_kl = dms[component_kl] + local_ao_loc[lsh]*(size_t)nao_kl + local_ao_loc[ksh];
+        }
         int expk = bas[ksh*BAS_SLOTS+PTR_EXP];
         int expl = bas[lsh*BAS_SLOTS+PTR_EXP];
         int ck = bas[ksh*BAS_SLOTS+PTR_COEFF];
@@ -22452,43 +22934,83 @@ while (1) {
                 dd_cache35 += fac * (dm[(j0+5)*nao+(k0+0)] * dm[(l0+0)*nao+(i0+5)] + dm[(j0+5)*nao+(l0+0)] * dm[(k0+0)*nao+(i0+5)]);
             }
             if (jk.j_factor != 0) {
-                double fac = fac_sym * jk.j_factor;
-                dd_cache0 += fac * dm[(l0+0)*nao+(k0+0)] * dm[(j0+0)*nao+(i0+0)];
-                dd_cache1 += fac * dm[(l0+0)*nao+(k0+0)] * dm[(j0+0)*nao+(i0+1)];
-                dd_cache2 += fac * dm[(l0+0)*nao+(k0+0)] * dm[(j0+0)*nao+(i0+2)];
-                dd_cache3 += fac * dm[(l0+0)*nao+(k0+0)] * dm[(j0+0)*nao+(i0+3)];
-                dd_cache4 += fac * dm[(l0+0)*nao+(k0+0)] * dm[(j0+0)*nao+(i0+4)];
-                dd_cache5 += fac * dm[(l0+0)*nao+(k0+0)] * dm[(j0+0)*nao+(i0+5)];
-                dd_cache6 += fac * dm[(l0+0)*nao+(k0+0)] * dm[(j0+1)*nao+(i0+0)];
-                dd_cache7 += fac * dm[(l0+0)*nao+(k0+0)] * dm[(j0+1)*nao+(i0+1)];
-                dd_cache8 += fac * dm[(l0+0)*nao+(k0+0)] * dm[(j0+1)*nao+(i0+2)];
-                dd_cache9 += fac * dm[(l0+0)*nao+(k0+0)] * dm[(j0+1)*nao+(i0+3)];
-                dd_cache10 += fac * dm[(l0+0)*nao+(k0+0)] * dm[(j0+1)*nao+(i0+4)];
-                dd_cache11 += fac * dm[(l0+0)*nao+(k0+0)] * dm[(j0+1)*nao+(i0+5)];
-                dd_cache12 += fac * dm[(l0+0)*nao+(k0+0)] * dm[(j0+2)*nao+(i0+0)];
-                dd_cache13 += fac * dm[(l0+0)*nao+(k0+0)] * dm[(j0+2)*nao+(i0+1)];
-                dd_cache14 += fac * dm[(l0+0)*nao+(k0+0)] * dm[(j0+2)*nao+(i0+2)];
-                dd_cache15 += fac * dm[(l0+0)*nao+(k0+0)] * dm[(j0+2)*nao+(i0+3)];
-                dd_cache16 += fac * dm[(l0+0)*nao+(k0+0)] * dm[(j0+2)*nao+(i0+4)];
-                dd_cache17 += fac * dm[(l0+0)*nao+(k0+0)] * dm[(j0+2)*nao+(i0+5)];
-                dd_cache18 += fac * dm[(l0+0)*nao+(k0+0)] * dm[(j0+3)*nao+(i0+0)];
-                dd_cache19 += fac * dm[(l0+0)*nao+(k0+0)] * dm[(j0+3)*nao+(i0+1)];
-                dd_cache20 += fac * dm[(l0+0)*nao+(k0+0)] * dm[(j0+3)*nao+(i0+2)];
-                dd_cache21 += fac * dm[(l0+0)*nao+(k0+0)] * dm[(j0+3)*nao+(i0+3)];
-                dd_cache22 += fac * dm[(l0+0)*nao+(k0+0)] * dm[(j0+3)*nao+(i0+4)];
-                dd_cache23 += fac * dm[(l0+0)*nao+(k0+0)] * dm[(j0+3)*nao+(i0+5)];
-                dd_cache24 += fac * dm[(l0+0)*nao+(k0+0)] * dm[(j0+4)*nao+(i0+0)];
-                dd_cache25 += fac * dm[(l0+0)*nao+(k0+0)] * dm[(j0+4)*nao+(i0+1)];
-                dd_cache26 += fac * dm[(l0+0)*nao+(k0+0)] * dm[(j0+4)*nao+(i0+2)];
-                dd_cache27 += fac * dm[(l0+0)*nao+(k0+0)] * dm[(j0+4)*nao+(i0+3)];
-                dd_cache28 += fac * dm[(l0+0)*nao+(k0+0)] * dm[(j0+4)*nao+(i0+4)];
-                dd_cache29 += fac * dm[(l0+0)*nao+(k0+0)] * dm[(j0+4)*nao+(i0+5)];
-                dd_cache30 += fac * dm[(l0+0)*nao+(k0+0)] * dm[(j0+5)*nao+(i0+0)];
-                dd_cache31 += fac * dm[(l0+0)*nao+(k0+0)] * dm[(j0+5)*nao+(i0+1)];
-                dd_cache32 += fac * dm[(l0+0)*nao+(k0+0)] * dm[(j0+5)*nao+(i0+2)];
-                dd_cache33 += fac * dm[(l0+0)*nao+(k0+0)] * dm[(j0+5)*nao+(i0+3)];
-                dd_cache34 += fac * dm[(l0+0)*nao+(k0+0)] * dm[(j0+5)*nao+(i0+4)];
-                dd_cache35 += fac * dm[(l0+0)*nao+(k0+0)] * dm[(j0+5)*nao+(i0+5)];
+                if (multi_in) {
+                    double fac = fac_sym * jk.j_factor;
+                    dd_cache0 += fac * dm_kl[(0)*nao_kl+(0)] * dm_ij[(0)*nao_ij+(0)];
+                    dd_cache1 += fac * dm_kl[(0)*nao_kl+(0)] * dm_ij[(0)*nao_ij+(1)];
+                    dd_cache2 += fac * dm_kl[(0)*nao_kl+(0)] * dm_ij[(0)*nao_ij+(2)];
+                    dd_cache3 += fac * dm_kl[(0)*nao_kl+(0)] * dm_ij[(0)*nao_ij+(3)];
+                    dd_cache4 += fac * dm_kl[(0)*nao_kl+(0)] * dm_ij[(0)*nao_ij+(4)];
+                    dd_cache5 += fac * dm_kl[(0)*nao_kl+(0)] * dm_ij[(0)*nao_ij+(5)];
+                    dd_cache6 += fac * dm_kl[(0)*nao_kl+(0)] * dm_ij[(1)*nao_ij+(0)];
+                    dd_cache7 += fac * dm_kl[(0)*nao_kl+(0)] * dm_ij[(1)*nao_ij+(1)];
+                    dd_cache8 += fac * dm_kl[(0)*nao_kl+(0)] * dm_ij[(1)*nao_ij+(2)];
+                    dd_cache9 += fac * dm_kl[(0)*nao_kl+(0)] * dm_ij[(1)*nao_ij+(3)];
+                    dd_cache10 += fac * dm_kl[(0)*nao_kl+(0)] * dm_ij[(1)*nao_ij+(4)];
+                    dd_cache11 += fac * dm_kl[(0)*nao_kl+(0)] * dm_ij[(1)*nao_ij+(5)];
+                    dd_cache12 += fac * dm_kl[(0)*nao_kl+(0)] * dm_ij[(2)*nao_ij+(0)];
+                    dd_cache13 += fac * dm_kl[(0)*nao_kl+(0)] * dm_ij[(2)*nao_ij+(1)];
+                    dd_cache14 += fac * dm_kl[(0)*nao_kl+(0)] * dm_ij[(2)*nao_ij+(2)];
+                    dd_cache15 += fac * dm_kl[(0)*nao_kl+(0)] * dm_ij[(2)*nao_ij+(3)];
+                    dd_cache16 += fac * dm_kl[(0)*nao_kl+(0)] * dm_ij[(2)*nao_ij+(4)];
+                    dd_cache17 += fac * dm_kl[(0)*nao_kl+(0)] * dm_ij[(2)*nao_ij+(5)];
+                    dd_cache18 += fac * dm_kl[(0)*nao_kl+(0)] * dm_ij[(3)*nao_ij+(0)];
+                    dd_cache19 += fac * dm_kl[(0)*nao_kl+(0)] * dm_ij[(3)*nao_ij+(1)];
+                    dd_cache20 += fac * dm_kl[(0)*nao_kl+(0)] * dm_ij[(3)*nao_ij+(2)];
+                    dd_cache21 += fac * dm_kl[(0)*nao_kl+(0)] * dm_ij[(3)*nao_ij+(3)];
+                    dd_cache22 += fac * dm_kl[(0)*nao_kl+(0)] * dm_ij[(3)*nao_ij+(4)];
+                    dd_cache23 += fac * dm_kl[(0)*nao_kl+(0)] * dm_ij[(3)*nao_ij+(5)];
+                    dd_cache24 += fac * dm_kl[(0)*nao_kl+(0)] * dm_ij[(4)*nao_ij+(0)];
+                    dd_cache25 += fac * dm_kl[(0)*nao_kl+(0)] * dm_ij[(4)*nao_ij+(1)];
+                    dd_cache26 += fac * dm_kl[(0)*nao_kl+(0)] * dm_ij[(4)*nao_ij+(2)];
+                    dd_cache27 += fac * dm_kl[(0)*nao_kl+(0)] * dm_ij[(4)*nao_ij+(3)];
+                    dd_cache28 += fac * dm_kl[(0)*nao_kl+(0)] * dm_ij[(4)*nao_ij+(4)];
+                    dd_cache29 += fac * dm_kl[(0)*nao_kl+(0)] * dm_ij[(4)*nao_ij+(5)];
+                    dd_cache30 += fac * dm_kl[(0)*nao_kl+(0)] * dm_ij[(5)*nao_ij+(0)];
+                    dd_cache31 += fac * dm_kl[(0)*nao_kl+(0)] * dm_ij[(5)*nao_ij+(1)];
+                    dd_cache32 += fac * dm_kl[(0)*nao_kl+(0)] * dm_ij[(5)*nao_ij+(2)];
+                    dd_cache33 += fac * dm_kl[(0)*nao_kl+(0)] * dm_ij[(5)*nao_ij+(3)];
+                    dd_cache34 += fac * dm_kl[(0)*nao_kl+(0)] * dm_ij[(5)*nao_ij+(4)];
+                    dd_cache35 += fac * dm_kl[(0)*nao_kl+(0)] * dm_ij[(5)*nao_ij+(5)];
+                } else {
+                    double fac = fac_sym * jk.j_factor;
+                    dd_cache0 += fac * dm[(l0+0)*nao+(k0+0)] * dm[(j0+0)*nao+(i0+0)];
+                    dd_cache1 += fac * dm[(l0+0)*nao+(k0+0)] * dm[(j0+0)*nao+(i0+1)];
+                    dd_cache2 += fac * dm[(l0+0)*nao+(k0+0)] * dm[(j0+0)*nao+(i0+2)];
+                    dd_cache3 += fac * dm[(l0+0)*nao+(k0+0)] * dm[(j0+0)*nao+(i0+3)];
+                    dd_cache4 += fac * dm[(l0+0)*nao+(k0+0)] * dm[(j0+0)*nao+(i0+4)];
+                    dd_cache5 += fac * dm[(l0+0)*nao+(k0+0)] * dm[(j0+0)*nao+(i0+5)];
+                    dd_cache6 += fac * dm[(l0+0)*nao+(k0+0)] * dm[(j0+1)*nao+(i0+0)];
+                    dd_cache7 += fac * dm[(l0+0)*nao+(k0+0)] * dm[(j0+1)*nao+(i0+1)];
+                    dd_cache8 += fac * dm[(l0+0)*nao+(k0+0)] * dm[(j0+1)*nao+(i0+2)];
+                    dd_cache9 += fac * dm[(l0+0)*nao+(k0+0)] * dm[(j0+1)*nao+(i0+3)];
+                    dd_cache10 += fac * dm[(l0+0)*nao+(k0+0)] * dm[(j0+1)*nao+(i0+4)];
+                    dd_cache11 += fac * dm[(l0+0)*nao+(k0+0)] * dm[(j0+1)*nao+(i0+5)];
+                    dd_cache12 += fac * dm[(l0+0)*nao+(k0+0)] * dm[(j0+2)*nao+(i0+0)];
+                    dd_cache13 += fac * dm[(l0+0)*nao+(k0+0)] * dm[(j0+2)*nao+(i0+1)];
+                    dd_cache14 += fac * dm[(l0+0)*nao+(k0+0)] * dm[(j0+2)*nao+(i0+2)];
+                    dd_cache15 += fac * dm[(l0+0)*nao+(k0+0)] * dm[(j0+2)*nao+(i0+3)];
+                    dd_cache16 += fac * dm[(l0+0)*nao+(k0+0)] * dm[(j0+2)*nao+(i0+4)];
+                    dd_cache17 += fac * dm[(l0+0)*nao+(k0+0)] * dm[(j0+2)*nao+(i0+5)];
+                    dd_cache18 += fac * dm[(l0+0)*nao+(k0+0)] * dm[(j0+3)*nao+(i0+0)];
+                    dd_cache19 += fac * dm[(l0+0)*nao+(k0+0)] * dm[(j0+3)*nao+(i0+1)];
+                    dd_cache20 += fac * dm[(l0+0)*nao+(k0+0)] * dm[(j0+3)*nao+(i0+2)];
+                    dd_cache21 += fac * dm[(l0+0)*nao+(k0+0)] * dm[(j0+3)*nao+(i0+3)];
+                    dd_cache22 += fac * dm[(l0+0)*nao+(k0+0)] * dm[(j0+3)*nao+(i0+4)];
+                    dd_cache23 += fac * dm[(l0+0)*nao+(k0+0)] * dm[(j0+3)*nao+(i0+5)];
+                    dd_cache24 += fac * dm[(l0+0)*nao+(k0+0)] * dm[(j0+4)*nao+(i0+0)];
+                    dd_cache25 += fac * dm[(l0+0)*nao+(k0+0)] * dm[(j0+4)*nao+(i0+1)];
+                    dd_cache26 += fac * dm[(l0+0)*nao+(k0+0)] * dm[(j0+4)*nao+(i0+2)];
+                    dd_cache27 += fac * dm[(l0+0)*nao+(k0+0)] * dm[(j0+4)*nao+(i0+3)];
+                    dd_cache28 += fac * dm[(l0+0)*nao+(k0+0)] * dm[(j0+4)*nao+(i0+4)];
+                    dd_cache29 += fac * dm[(l0+0)*nao+(k0+0)] * dm[(j0+4)*nao+(i0+5)];
+                    dd_cache30 += fac * dm[(l0+0)*nao+(k0+0)] * dm[(j0+5)*nao+(i0+0)];
+                    dd_cache31 += fac * dm[(l0+0)*nao+(k0+0)] * dm[(j0+5)*nao+(i0+1)];
+                    dd_cache32 += fac * dm[(l0+0)*nao+(k0+0)] * dm[(j0+5)*nao+(i0+2)];
+                    dd_cache33 += fac * dm[(l0+0)*nao+(k0+0)] * dm[(j0+5)*nao+(i0+3)];
+                    dd_cache34 += fac * dm[(l0+0)*nao+(k0+0)] * dm[(j0+5)*nao+(i0+4)];
+                    dd_cache35 += fac * dm[(l0+0)*nao+(k0+0)] * dm[(j0+5)*nao+(i0+5)];
+                }
             }
         } else {
             double *dmb = dm + nao * nao;
@@ -24005,8 +24527,9 @@ while (1) {
 }
 }
 
+template <bool multi_in, bool exclude_component_self>
 __global__ static
-void rys_ejk_ip1_2210(JKENERGY_KERNEL_ARGS)
+void rys_ejk_ip1_2210(JKENERGY_MULTI_KERNEL_ARGS)
 {
     JKENERGY_KERNEL_SETUP();
     constexpr int nsq_per_block = 32;
@@ -24047,12 +24570,14 @@ while (1) {
     if (jk.omega >= 0) {
         _fill_ejk_tasks(ntasks, pair_kl0, bas_kl_idx, pair_ij, ish, jsh,
                         q_cond_ij, q_cond_kl,
-                        (int *)shared_memory, jk, envs, bounds);
+                        (int *)shared_memory, jk, envs, bounds,
+                        component_id, exclude_component_self);
     } else {
         _fill_sr_ejk_tasks(ntasks, pair_kl0, bas_kl_idx, pair_ij, ish, jsh,
                            q_cond_ij, q_cond_kl,
                            s_cond_ij, s_cond_kl, diffuse_exps,
-                           (int *)shared_memory, jk, envs, bounds);
+                           (int *)shared_memory, jk, envs, bounds,
+                        component_id, exclude_component_self);
     }
     if (ntasks == 0) {
         continue;
@@ -24112,6 +24637,18 @@ while (1) {
         int j0 = ao_loc[jsh];
         int k0 = ao_loc[ksh];
         int l0 = ao_loc[lsh];
+        double *dm_ij;
+        double *dm_kl;
+        int nao_ij;
+        int nao_kl;
+        if (multi_in) {
+            int component_ij = component_id[ish];
+            int component_kl = component_id[ksh];
+            nao_ij = component_nao[component_ij];
+            nao_kl = component_nao[component_kl];
+            dm_ij = dms[component_ij] + local_ao_loc[jsh]*(size_t)nao_ij + local_ao_loc[ish];
+            dm_kl = dms[component_kl] + local_ao_loc[lsh]*(size_t)nao_kl + local_ao_loc[ksh];
+        }
         int expk = bas[ksh*BAS_SLOTS+PTR_EXP];
         int expl = bas[lsh*BAS_SLOTS+PTR_EXP];
         int ck = bas[ksh*BAS_SLOTS+PTR_COEFF];
@@ -24162,7 +24699,11 @@ while (1) {
                     dd += jk.k_factor * (dm[_jk] * dm[_li] + dm[_jl] * dm[_ki]);
                 }
                 if (do_j) {
-                    dd += jk.j_factor * dm[_ji] * dm[_lk];
+                    if (multi_in) {
+                        dd += jk.j_factor * dm_ij[j*nao_ij+i] * dm_kl[l*nao_kl+k];
+                    } else {
+                        dd += jk.j_factor * dm[_ji] * dm[_lk];
+                    }
                 }
                 dd_cache[n*32] = fac_sym * dd;
             }
@@ -26510,10 +27051,11 @@ while (1) {
 }
 }
 
-int rys_ejk_ip1_unrolled(RysIntEnvVars *envs, JKEnergy *jk, BoundsInfo *bounds,
+template <bool multi_in, bool exclude_component_self>
+int rys_ejk_ip1_unrolled_template(RysIntEnvVars *envs, JKEnergy *jk, BoundsInfo *bounds,
                         float *q_cond_ij, float *q_cond_kl, float dm_penalty,
                         float *s_cond_ij, float *s_cond_kl, float *diffuse_exps,
-                        uint32_t *pool, double *dd_pool, int *head, int workers)
+                        uint32_t *pool, double *dd_pool, int *head, int workers, double **dms, int *component_id, int *local_ao_loc, int *component_nao)
 {
     int li = bounds->li;
     int lj = bounds->lj;
@@ -26526,32 +27068,32 @@ int rys_ejk_ip1_unrolled(RysIntEnvVars *envs, JKEnergy *jk, BoundsInfo *bounds,
 
     switch (ijkl) {
     case 0: // (0, 0, 0, 0)
-        adjust_threads(rys_ejk_ip1_0000, nsq_per_block);
+        adjust_threads((rys_ejk_ip1_0000<multi_in, exclude_component_self>), nsq_per_block);
         break;
     case 125: // (1, 0, 0, 0)
-        adjust_threads(rys_ejk_ip1_1000, nsq_per_block);
+        adjust_threads((rys_ejk_ip1_1000<multi_in, exclude_component_self>), nsq_per_block);
         break;
     case 130: // (1, 0, 1, 0)
-        adjust_threads(rys_ejk_ip1_1010, nsq_per_block);
+        adjust_threads((rys_ejk_ip1_1010<multi_in, exclude_component_self>), nsq_per_block);
         break;
     case 131: // (1, 0, 1, 1)
-        adjust_threads(rys_ejk_ip1_1011, nsq_per_block);
+        adjust_threads((rys_ejk_ip1_1011<multi_in, exclude_component_self>), nsq_per_block);
         break;
     case 150: // (1, 1, 0, 0)
-        adjust_threads(rys_ejk_ip1_1100, nsq_per_block);
+        adjust_threads((rys_ejk_ip1_1100<multi_in, exclude_component_self>), nsq_per_block);
         break;
     case 155: // (1, 1, 1, 0)
-        adjust_threads(rys_ejk_ip1_1110, nsq_per_block);
+        adjust_threads((rys_ejk_ip1_1110<multi_in, exclude_component_self>), nsq_per_block);
         break;
     case 156: // (1, 1, 1, 1)
         nsq_per_block = 32;
         gout_stride = 8;
         break;
     case 250: // (2, 0, 0, 0)
-        adjust_threads(rys_ejk_ip1_2000, nsq_per_block);
+        adjust_threads((rys_ejk_ip1_2000<multi_in, exclude_component_self>), nsq_per_block);
         break;
     case 255: // (2, 0, 1, 0)
-        adjust_threads(rys_ejk_ip1_2010, nsq_per_block);
+        adjust_threads((rys_ejk_ip1_2010<multi_in, exclude_component_self>), nsq_per_block);
         break;
     case 256: // (2, 0, 1, 1)
         nsq_per_block = 64;
@@ -26564,7 +27106,7 @@ int rys_ejk_ip1_unrolled(RysIntEnvVars *envs, JKEnergy *jk, BoundsInfo *bounds,
         gout_stride = 8;
         break;
     case 275: // (2, 1, 0, 0)
-        adjust_threads(rys_ejk_ip1_2100, nsq_per_block);
+        adjust_threads((rys_ejk_ip1_2100<multi_in, exclude_component_self>), nsq_per_block);
         break;
     case 280: // (2, 1, 1, 0)
         nsq_per_block = 64;
@@ -26592,49 +27134,83 @@ int rys_ejk_ip1_unrolled(RysIntEnvVars *envs, JKEnergy *jk, BoundsInfo *bounds,
     int buflen = nroots*2 * nsq_per_block + iprim*jprim;
     switch (ijkl) {
     case 0: // (0, 0, 0, 0)
-        LAUNCH_JKENERGY_KERNEL(rys_ejk_ip1_0000); break;
+        LAUNCH_JKENERGY_MULTI_KERNEL(rys_ejk_ip1_0000); break;
     case 125: // (1, 0, 0, 0)
-        LAUNCH_JKENERGY_KERNEL(rys_ejk_ip1_1000); break;
+        LAUNCH_JKENERGY_MULTI_KERNEL(rys_ejk_ip1_1000); break;
     case 130: // (1, 0, 1, 0)
-        LAUNCH_JKENERGY_KERNEL(rys_ejk_ip1_1010); break;
+        LAUNCH_JKENERGY_MULTI_KERNEL(rys_ejk_ip1_1010); break;
     case 131: // (1, 0, 1, 1)
-        LAUNCH_JKENERGY_KERNEL(rys_ejk_ip1_1011); break;
+        LAUNCH_JKENERGY_MULTI_KERNEL(rys_ejk_ip1_1011); break;
     case 150: // (1, 1, 0, 0)
-        LAUNCH_JKENERGY_KERNEL(rys_ejk_ip1_1100); break;
+        LAUNCH_JKENERGY_MULTI_KERNEL(rys_ejk_ip1_1100); break;
     case 155: // (1, 1, 1, 0)
-        LAUNCH_JKENERGY_KERNEL(rys_ejk_ip1_1110); break;
+        LAUNCH_JKENERGY_MULTI_KERNEL(rys_ejk_ip1_1110); break;
     case 156: // (1, 1, 1, 1)
         buflen = 4032 + iprim * jprim;
-        LAUNCH_JKENERGY_KERNEL(rys_ejk_ip1_1111); break;
+        LAUNCH_JKENERGY_MULTI_KERNEL(rys_ejk_ip1_1111); break;
     case 250: // (2, 0, 0, 0)
-        LAUNCH_JKENERGY_KERNEL(rys_ejk_ip1_2000); break;
+        LAUNCH_JKENERGY_MULTI_KERNEL(rys_ejk_ip1_2000); break;
     case 255: // (2, 0, 1, 0)
-        LAUNCH_JKENERGY_KERNEL(rys_ejk_ip1_2010); break;
+        LAUNCH_JKENERGY_MULTI_KERNEL(rys_ejk_ip1_2010); break;
     case 256: // (2, 0, 1, 1)
         buflen = 5760 + iprim * jprim;
-        LAUNCH_JKENERGY_KERNEL(rys_ejk_ip1_2011); break;
+        LAUNCH_JKENERGY_MULTI_KERNEL(rys_ejk_ip1_2011); break;
     case 260: // (2, 0, 2, 0)
-        LAUNCH_JKENERGY_KERNEL(rys_ejk_ip1_2020); break;
+        LAUNCH_JKENERGY_MULTI_KERNEL(rys_ejk_ip1_2020); break;
     case 261: // (2, 0, 2, 1)
         buflen = 3776 + iprim * jprim;
-        LAUNCH_JKENERGY_KERNEL(rys_ejk_ip1_2021); break;
+        LAUNCH_JKENERGY_MULTI_KERNEL(rys_ejk_ip1_2021); break;
     case 275: // (2, 1, 0, 0)
-        LAUNCH_JKENERGY_KERNEL(rys_ejk_ip1_2100); break;
+        LAUNCH_JKENERGY_MULTI_KERNEL(rys_ejk_ip1_2100); break;
     case 280: // (2, 1, 1, 0)
         buflen = 5760 + iprim * jprim;
-        LAUNCH_JKENERGY_KERNEL(rys_ejk_ip1_2110); break;
+        LAUNCH_JKENERGY_MULTI_KERNEL(rys_ejk_ip1_2110); break;
     case 281: // (2, 1, 1, 1)
         buflen = 5312 + iprim * jprim;
-        LAUNCH_JKENERGY_KERNEL(rys_ejk_ip1_2111); break;
+        LAUNCH_JKENERGY_MULTI_KERNEL(rys_ejk_ip1_2111); break;
     case 285: // (2, 1, 2, 0)
         buflen = 3776 + iprim * jprim;
-        LAUNCH_JKENERGY_KERNEL(rys_ejk_ip1_2120); break;
+        LAUNCH_JKENERGY_MULTI_KERNEL(rys_ejk_ip1_2120); break;
     case 300: // (2, 2, 0, 0)
-        LAUNCH_JKENERGY_KERNEL(rys_ejk_ip1_2200); break;
+        LAUNCH_JKENERGY_MULTI_KERNEL(rys_ejk_ip1_2200); break;
     case 305: // (2, 2, 1, 0)
         buflen = 4160 + iprim * jprim;
-        LAUNCH_JKENERGY_KERNEL(rys_ejk_ip1_2210); break;
+        LAUNCH_JKENERGY_MULTI_KERNEL(rys_ejk_ip1_2210); break;
     default: return 0;
     }
     return 1;
+}
+
+int rys_ejk_ip1_unrolled(RysIntEnvVars *envs, JKEnergy *jk, BoundsInfo *bounds,
+                        float *q_cond_ij, float *q_cond_kl, float dm_penalty,
+                        float *s_cond_ij, float *s_cond_kl, float *diffuse_exps,
+                        uint32_t *pool, double *dd_pool, int *head, int workers)
+{
+    return rys_ejk_ip1_unrolled_template<false, false>(
+        envs, jk, bounds, q_cond_ij, q_cond_kl, dm_penalty,
+        s_cond_ij, s_cond_kl, diffuse_exps, pool, dd_pool, head, workers,
+        NULL, NULL, NULL, NULL);
+}
+
+int rys_ej_ip1_unrolled_multi_in(RysIntEnvVars *envs, JKEnergy *jk,
+                                 BoundsInfo *bounds, float *q_cond_ij,
+                                 float *q_cond_kl, float dm_penalty,
+                                 float *s_cond_ij, float *s_cond_kl,
+                                 float *diffuse_exps, uint32_t *pool,
+                                 double *dd_pool, int *head, int workers,
+                                 double **dms, int *component_id,
+                                 int *local_ao_loc, int *component_nao,
+                                 int exclude_component_self)
+{
+    if (exclude_component_self) {
+        return rys_ejk_ip1_unrolled_template<true, true>(
+            envs, jk, bounds, q_cond_ij, q_cond_kl, dm_penalty,
+            s_cond_ij, s_cond_kl, diffuse_exps, pool, dd_pool, head, workers,
+            dms, component_id, local_ao_loc, component_nao);
+    } else {
+        return rys_ejk_ip1_unrolled_template<true, false>(
+            envs, jk, bounds, q_cond_ij, q_cond_kl, dm_penalty,
+            s_cond_ij, s_cond_kl, diffuse_exps, pool, dd_pool, head, workers,
+            dms, component_id, local_ao_loc, component_nao);
+    }
 }

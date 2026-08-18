@@ -822,7 +822,9 @@ static void _fill_ejk_tasks(int& ntasks, int& pair_kl0, uint32_t *bas_kl_idx,
                             int pair_ij, int ish, int jsh,
                             float *q_cond_ij, float *q_cond_kl,
                             int *swap,
-                            JKEnergy &jk, RysIntEnvVars envs, BoundsInfo bounds)
+                            JKEnergy &jk, RysIntEnvVars envs, BoundsInfo bounds,
+                            int *component_id=NULL,
+                            bool exclude_component_self=false)
 {
     int t_id = threadIdx.y * blockDim.x + threadIdx.x;
     int threads = blockDim.x * blockDim.y;
@@ -859,6 +861,10 @@ static void _fill_ejk_tasks(int& ntasks, int& pair_kl0, uint32_t *bas_kl_idx,
                 pair_kl0 = pair_kl1;
             }
             keep = q_kl >= kl_cutoff && bas_ij >= bas_kl;
+            if (keep && exclude_component_self) {
+                uint32_t ksh = bas_kl / nbas;
+                keep = component_id[ish] != component_id[ksh];
+            }
             if (keep) {
                 uint32_t ksh = bas_kl / nbas;
                 uint32_t lsh = bas_kl - nbas * ksh;
@@ -891,7 +897,9 @@ static void _fill_sr_ejk_tasks(int& ntasks, int& pair_kl0, uint32_t *bas_kl_idx,
                                float *q_cond_ij, float *q_cond_kl,
                                float *s_cond_ij, float *s_cond_kl, float *diffuse_exps,
                                int *swap,
-                               JKEnergy &jk, RysIntEnvVars envs, BoundsInfo bounds)
+                               JKEnergy &jk, RysIntEnvVars envs, BoundsInfo bounds,
+                               int *component_id=NULL,
+                               bool exclude_component_self=false)
 {
     int t_id = threadIdx.y * blockDim.x + threadIdx.x;
     int threads = blockDim.x * blockDim.y;
@@ -956,6 +964,10 @@ static void _fill_sr_ejk_tasks(int& ntasks, int& pair_kl0, uint32_t *bas_kl_idx,
                 pair_kl0 = pair_kl1;
             }
             keep = q_kl >= kl_cutoff && bas_ij >= bas_kl;
+            if (keep && exclude_component_self) {
+                uint32_t ksh = bas_kl / nbas;
+                keep = component_id[ish] != component_id[ksh];
+            }
             if (keep) {
                 uint32_t ksh = bas_kl / nbas;
                 uint32_t lsh = bas_kl - nbas * ksh;

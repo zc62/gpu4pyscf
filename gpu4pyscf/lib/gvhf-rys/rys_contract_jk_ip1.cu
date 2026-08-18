@@ -350,12 +350,16 @@ while (1) {
 }
 }
 
+// multi_in selects a component density matrix for each shell pair.
+template <bool multi_in, bool exclude_component_self>
 __global__ static
 void rys_ejk_ip1_kernel(RysIntEnvVars envs, JKEnergy jk, BoundsInfo bounds,
                         float *q_cond_ij, float *q_cond_kl, float dm_penalty,
                         float *s_cond_ij, float *s_cond_kl, float *diffuse_exps,
                         uint32_t *pool, int *head, double *dd_pool, int nf,
-                        int reserved_shm_size)
+                        int reserved_shm_size, double **dms,
+                        int *component_id, int *local_ao_loc,
+                        int *component_nao)
 {
     int sq_id = threadIdx.x;
     int nsq_per_block = blockDim.x;
@@ -426,12 +430,14 @@ while (1) {
     if (jk.lr_factor != 0) {
         _fill_ejk_tasks(ntasks, pair_kl0, bas_kl_idx, pair_ij, ish, jsh,
                         q_cond_ij, q_cond_kl,
-                        (int *)shared_memory, jk, envs, bounds);
+                        (int *)shared_memory, jk, envs, bounds,
+                        component_id, exclude_component_self);
     } else {
         _fill_sr_ejk_tasks(ntasks, pair_kl0, bas_kl_idx, pair_ij, ish, jsh,
                            q_cond_ij, q_cond_kl,
                            s_cond_ij, s_cond_kl, diffuse_exps,
-                           (int *)shared_memory, jk, envs, bounds);
+                           (int *)shared_memory, jk, envs, bounds,
+                           component_id, exclude_component_self);
     }
     if (ntasks == 0) {
         continue;
@@ -542,9 +548,19 @@ while (1) {
                     dd += jk.k_factor * (dm[_jk] * dm[_li] + dm[_jl] * dm[_ki]);
                 }
                 if (do_j) {
-                    int _ji = _j*nao+_i;
-                    int _lk = _l*nao+_k;
-                    dd += jk.j_factor * dm[_ji] * dm[_lk];
+                    if (multi_in) {
+                        int component_ij = component_id[ish];
+                        int component_kl = component_id[ksh];
+                        int nao_ij = component_nao[component_ij];
+                        int nao_kl = component_nao[component_kl];
+                        int _ji = (j + local_ao_loc[jsh])*nao_ij + i + local_ao_loc[ish];
+                        int _lk = (l + local_ao_loc[lsh])*nao_kl + k + local_ao_loc[ksh];
+                        dd += jk.j_factor * dms[component_ij][_ji] * dms[component_kl][_lk];
+                    } else {
+                        int _ji = _j*nao+_i;
+                        int _lk = _l*nao+_k;
+                        dd += jk.j_factor * dm[_ji] * dm[_lk];
+                    }
                 }
                 dd_cache[n*nsq_per_block] = fac_sym * dd;
             }
@@ -1653,6 +1669,16 @@ extern int rys_ejk_ip1_unrolled(RysIntEnvVars *envs, JKEnergy *jk, BoundsInfo *b
                                 float *s_cond_ij, float *s_cond_kl, float *diffuse_exps,
                                 uint32_t *pool, double *dd_pool, int *head, int workers);
 
+extern int rys_ej_ip1_unrolled_multi_in(RysIntEnvVars *envs, JKEnergy *jk,
+                                        BoundsInfo *bounds, float *q_cond_ij,
+                                        float *q_cond_kl, float dm_penalty,
+                                        float *s_cond_ij, float *s_cond_kl,
+                                        float *diffuse_exps, uint32_t *pool,
+                                        double *dd_pool, int *head, int workers,
+                                        double **dms, int *component_id,
+                                        int *local_ao_loc, int *component_nao,
+                                        int exclude_component_self);
+
 extern "C" {
 int RYS_build_jk_ip1(double *vj, double *vk, double *dm, int n_dm, int nao, int atom_offset,
                      double omega, double lr_factor, double sr_factor,
@@ -1808,7 +1834,7 @@ int RYS_per_atom_jk_ip1(double *ejk, double j_factor, double k_factor,
         int reserved_shm_size = max(buflen, 6*gout_stride*quartets_per_block);
         buflen = (reserved_shm_size + ij_prims)*sizeof(double);
         if (buflen > 48000) {
-            cudaFuncSetAttribute(rys_ejk_ip1_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, buflen);
+            cudaFuncSetAttribute(rys_ejk_ip1_kernel<false, false>, cudaFuncAttributeMaxDynamicSharedMemorySize, buflen);
             cudaError_t err = cudaGetLastError();
             if (err != cudaSuccess) {
                 fprintf(stderr, "Failed to set CUDA shm size %d: %s\n", buflen,
@@ -1816,10 +1842,10 @@ int RYS_per_atom_jk_ip1(double *ejk, double j_factor, double k_factor,
                 return 1;
             }
         }
-        rys_ejk_ip1_kernel<<<workers, threads, buflen>>>(
+        rys_ejk_ip1_kernel<false, false><<<workers, threads, buflen>>>(
             envs, jk, bounds, q_cond_ij, q_cond_kl, dm_penalty,
             s_cond_ij, s_cond_kl, diffuse_exps, pool, head, dd_pool, nf,
-            reserved_shm_size);
+            reserved_shm_size, NULL, NULL, NULL, NULL);
     }
     cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) {
@@ -1832,6 +1858,166 @@ int RYS_per_atom_jk_ip1(double *ejk, double j_factor, double k_factor,
         return 1;
     }
     return 0;
+}
+
+// J-only cross-component gradient with multiple density-matrix inputs.
+static int RYS_per_atom_j_ip1_multi_in_impl(double *ejk, double **dms,
+                                int *component_id, int *local_ao_loc,
+                                int *component_nao,
+                                RysIntEnvVars envs, int *scheme, int *shls_slice,
+                                int npairs_ij, int npairs_kl,
+                                uint32_t *pair_ij_mapping, uint32_t *pair_kl_mapping,
+                                float *q_cond_ij, float *q_cond_kl,
+                                float *s_cond_ij, float *s_cond_kl,
+                                float *diffuse_exps, float *dm_cond,
+                                float cutoff, float dm_penalty,
+                                uint32_t *pool, double *dd_pool,
+                                int *atm, int natm, int *bas, int nbas,
+                                double *env, int exclude_component_self)
+{
+    int ish0 = shls_slice[0];
+    int jsh0 = shls_slice[2];
+    int ksh0 = shls_slice[4];
+    int lsh0 = shls_slice[6];
+    int li = bas[ANG_OF + ish0*BAS_SLOTS];
+    int lj = bas[ANG_OF + jsh0*BAS_SLOTS];
+    int lk = bas[ANG_OF + ksh0*BAS_SLOTS];
+    int ll = bas[ANG_OF + lsh0*BAS_SLOTS];
+    int iprim = bas[NPRIM_OF + ish0*BAS_SLOTS];
+    int jprim = bas[NPRIM_OF + jsh0*BAS_SLOTS];
+    int kprim = bas[NPRIM_OF + ksh0*BAS_SLOTS];
+    int lprim = bas[NPRIM_OF + lsh0*BAS_SLOTS];
+    int nfi = (li+1)*(li+2)/2;
+    int nfj = (lj+1)*(lj+2)/2;
+    int nfk = (lk+1)*(lk+2)/2;
+    int nfl = (ll+1)*(ll+2)/2;
+    int order = li + lj + lk + ll;
+    int nroots = (order + 1) / 2 + 1;
+    double omega = env[PTR_RANGE_OMEGA];
+    if (omega < 0) { // SR ERIs
+        nroots *= 2;
+    }
+    int stride_j = li + 2;
+    int stride_k = stride_j * (lj + 1);
+    int stride_l = stride_k * (lk + 2);
+    int g_size = stride_l * (ll + 1);
+    BoundsInfo bounds = {li, lj, lk, ll, nfi, nfj, nfk, nfl,
+        nroots, stride_j, stride_k, stride_l, g_size,
+        iprim, jprim, kprim, lprim,
+        npairs_ij, npairs_kl, pair_ij_mapping, pair_kl_mapping,
+        NULL, NULL, dm_cond, cutoff};
+
+    JKEnergy jk = {ejk, NULL, 4., 0., 1, omega};
+    if (omega >= 0) {
+        jk.lr_factor = 1;
+        jk.sr_factor = 0;
+    } else {
+        jk.lr_factor = 0;
+        jk.sr_factor = 1;
+    }
+
+    cudaDeviceProp prop;
+    cudaGetDeviceProperties(&prop, 0);
+    int workers = prop.multiProcessorCount;
+    int *head = (int *)(pool + workers * QUEUE_DEPTH);
+    cudaMemset(head, 0, sizeof(int));
+
+    if (!rys_ej_ip1_unrolled_multi_in(
+            &envs, &jk, &bounds, q_cond_ij, q_cond_kl, dm_penalty,
+            s_cond_ij, s_cond_kl, diffuse_exps, pool, dd_pool, head, workers,
+            dms, component_id, local_ao_loc, component_nao,
+            exclude_component_self)) {
+        int nf = nfi * nfj * nfk * nfl;
+        int quartets_per_block = scheme[0];
+        int gout_stride = scheme[1];
+        int ij_prims = iprim * jprim;
+        dim3 threads(quartets_per_block, gout_stride);
+        int buflen = (nroots*2 + g_size*3 + 6) * quartets_per_block;
+        int reserved_shm_size = max(buflen, 6*gout_stride*quartets_per_block);
+        buflen = (reserved_shm_size + ij_prims)*sizeof(double);
+        if (buflen > 48000) {
+            if (exclude_component_self) {
+                cudaFuncSetAttribute(rys_ejk_ip1_kernel<true, true>, cudaFuncAttributeMaxDynamicSharedMemorySize, buflen);
+            } else {
+                cudaFuncSetAttribute(rys_ejk_ip1_kernel<true, false>, cudaFuncAttributeMaxDynamicSharedMemorySize, buflen);
+            }
+            cudaError_t err = cudaGetLastError();
+            if (err != cudaSuccess) {
+                fprintf(stderr, "Failed to set CUDA shm size %d: %s\n", buflen,
+                        cudaGetErrorString(err));
+                return 1;
+            }
+        }
+        if (exclude_component_self) {
+            rys_ejk_ip1_kernel<true, true><<<workers, threads, buflen>>>(
+                envs, jk, bounds, q_cond_ij, q_cond_kl, dm_penalty,
+                s_cond_ij, s_cond_kl, diffuse_exps, pool, head, dd_pool, nf,
+                reserved_shm_size, dms, component_id, local_ao_loc,
+                component_nao);
+        } else {
+            rys_ejk_ip1_kernel<true, false><<<workers, threads, buflen>>>(
+                envs, jk, bounds, q_cond_ij, q_cond_kl, dm_penalty,
+                s_cond_ij, s_cond_kl, diffuse_exps, pool, head, dd_pool, nf,
+                reserved_shm_size, dms, component_id, local_ao_loc,
+                component_nao);
+        }
+    }
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        int device_id = -1;
+        const cudaError_t err_get_device_id = cudaGetDevice(&device_id);
+        if (err_get_device_id != cudaSuccess) {
+            printf("Failed also in cudaGetDevice(), device_id value is not reliable\n"); fflush(stdout);
+        }
+        fprintf(stderr, "CUDA Error in RYS_per_atom_j_ip1_multi_in, li,lj,lk,ll = %d,%d,%d,%d, device_id = %d, error message = %s\n", li,lj,lk,ll, device_id, cudaGetErrorString(err)); fflush(stderr);
+        return 1;
+    }
+    return 0;
+}
+
+int RYS_per_atom_j_ip1_multi_in(double *ejk, double **dms,
+                                int *component_id, int *local_ao_loc,
+                                int *component_nao,
+                                RysIntEnvVars envs, int *scheme, int *shls_slice,
+                                int npairs_ij, int npairs_kl,
+                                uint32_t *pair_ij_mapping, uint32_t *pair_kl_mapping,
+                                float *q_cond_ij, float *q_cond_kl,
+                                float *s_cond_ij, float *s_cond_kl,
+                                float *diffuse_exps, float *dm_cond,
+                                float cutoff, float dm_penalty,
+                                uint32_t *pool, double *dd_pool,
+                                int *atm, int natm, int *bas, int nbas, double *env)
+{
+    return RYS_per_atom_j_ip1_multi_in_impl(
+        ejk, dms, component_id, local_ao_loc, component_nao,
+        envs, scheme, shls_slice, npairs_ij, npairs_kl,
+        pair_ij_mapping, pair_kl_mapping, q_cond_ij, q_cond_kl,
+        s_cond_ij, s_cond_kl, diffuse_exps, dm_cond, cutoff, dm_penalty,
+        pool, dd_pool, atm, natm, bas, nbas, env, 0);
+}
+
+int RYS_per_atom_j_ip1_multi_in_no_self(double *ejk, double **dms,
+                                        int *component_id, int *local_ao_loc,
+                                        int *component_nao,
+                                        RysIntEnvVars envs, int *scheme,
+                                        int *shls_slice, int npairs_ij,
+                                        int npairs_kl,
+                                        uint32_t *pair_ij_mapping,
+                                        uint32_t *pair_kl_mapping,
+                                        float *q_cond_ij, float *q_cond_kl,
+                                        float *s_cond_ij, float *s_cond_kl,
+                                        float *diffuse_exps, float *dm_cond,
+                                        float cutoff, float dm_penalty,
+                                        uint32_t *pool, double *dd_pool,
+                                        int *atm, int natm, int *bas, int nbas,
+                                        double *env)
+{
+    return RYS_per_atom_j_ip1_multi_in_impl(
+        ejk, dms, component_id, local_ao_loc, component_nao,
+        envs, scheme, shls_slice, npairs_ij, npairs_kl,
+        pair_ij_mapping, pair_kl_mapping, q_cond_ij, q_cond_kl,
+        s_cond_ij, s_cond_kl, diffuse_exps, dm_cond, cutoff, dm_penalty,
+        pool, dd_pool, atm, natm, bas, nbas, env, 1);
 }
 
 // only support RHF density matrices

@@ -535,6 +535,203 @@ void unrolled_contract_int3c2e(RysIntEnvVars& envs, JKMatrix& jk,
     }
 }
 
+template <int LK, int RT_SIZE> __device__ inline
+void unrolled_contract_int3c2e_multi_out(RysIntEnvVars& envs, JKMatrix& jk,
+                                         double **vj, int *pair_component,
+                                         int *shl_pair_offsets,
+                                         uint32_t *bas_ij_idx,
+                                         int *pair_ij_loc, int *nsp_lookup)
+{
+    constexpr int lk = LK;
+    constexpr int nfk = (lk + 1) * (lk + 2) / 2;
+    constexpr int nf3k = nfk * (lk + 3) / 3;
+    int sp_block_id = gridDim.y - blockIdx.y - 1;
+    int ksh = gridDim.x - blockIdx.x - 1 + envs.nbas;
+    int thread_id = threadIdx.x;
+    int *bas = envs.bas;
+    double *env = envs.env;
+    __shared__ int shl_pair0, shl_pair1;
+    if (thread_id == 0) {
+        shl_pair0 = shl_pair_offsets[sp_block_id];
+        shl_pair1 = shl_pair_offsets[sp_block_id+1];
+    }
+    __syncthreads();
+    int bas_ij0 = bas_ij_idx[shl_pair0];
+    int ish0 = bas_ij0 / envs.nbas;
+    int jsh0 = bas_ij0 % envs.nbas;
+    int li = bas[ANG_OF + ish0*BAS_SLOTS];
+    int lj = bas[ANG_OF + jsh0*BAS_SLOTS];
+    int lij = li + lj;
+    __shared__ int order, nf3ij, kprim;
+    __shared__ int nsp_per_block, Rt_stride;
+    __shared__ double rk[3];
+    if (thread_id == 0) {
+        order = lij + lk;
+        nf3ij = (lij+1)*(lij+2)*(lij+3) / 6;
+        kprim = bas[ksh*BAS_SLOTS+NPRIM_OF];
+        int rk_ptr = bas[ksh*BAS_SLOTS+PTR_BAS_COORD];
+        rk[0] = env[rk_ptr+0];
+        rk[1] = env[rk_ptr+1];
+        rk[2] = env[rk_ptr+2];
+        nsp_per_block = nsp_lookup[lij*(L_AUX_MAX+1)+lk];
+        Rt_stride = blockDim.x / nsp_per_block;
+    }
+    __syncthreads();
+    int sp_id = thread_id % nsp_per_block;
+    int Rt_id = thread_id / nsp_per_block;
+
+    extern __shared__ double shared_memory[];
+    double *gamma_inc = shared_memory + sp_id;
+    double *Rt = shared_memory + (order+1) * nsp_per_block + sp_id;
+    uint16_t *p1_ij = Rt2_kl_ij + Rt2_idx_offsets[lij*RT2_MAX+lk];
+    int8_t *efg_phase = c_Rt2_efg_phase + Rt2_idx_offsets[lk];
+    for (int kp = 0; kp < kprim; ++kp) {
+        __syncthreads();
+        __shared__ double ak, ck;
+        if (thread_id == 0) {
+            ck = env[bas[ksh*BAS_SLOTS+PTR_COEFF] + kp] * PI_FAC;
+            ak = env[bas[ksh*BAS_SLOTS+PTR_EXP] + kp];
+        }
+        for (int pair_ij = shl_pair0+sp_id; pair_ij < shl_pair1+sp_id; pair_ij += nsp_per_block) {
+            __syncthreads();
+            int bas_ij;
+            if (pair_ij < shl_pair1) {
+                bas_ij = bas_ij_idx[pair_ij];
+            } else {
+                bas_ij = bas_ij_idx[shl_pair0];
+            }
+            int ish = bas_ij / envs.nbas;
+            int jsh = bas_ij % envs.nbas;
+            double ai = env[bas[ish*BAS_SLOTS+PTR_EXP]];
+            double aj = env[bas[jsh*BAS_SLOTS+PTR_EXP]];
+            double *ri = env + bas[ish*BAS_SLOTS+PTR_BAS_COORD];
+            double *rj = env + bas[jsh*BAS_SLOTS+PTR_BAS_COORD];
+            double aij = ai + aj;
+            double xij = (ai * ri[0] + aj * rj[0]) / aij;
+            double yij = (ai * ri[1] + aj * rj[1]) / aij;
+            double zij = (ai * ri[2] + aj * rj[2]) / aij;
+            double xpq = xij - rk[0];
+            double ypq = yij - rk[1];
+            double zpq = zij - rk[2];
+            double rr = xpq*xpq + ypq*ypq + zpq*zpq;
+            double theta = aij * ak / (aij + ak);
+            if (Rt_id == 0) {
+                double fac = ck/(aij*ak*sqrt(aij+ak));
+                if (pair_ij >= shl_pair1) {
+                    fac = 0;
+                }
+                boys_fn(gamma_inc, theta, rr, jk.omega, fac, order, 0, nsp_per_block);
+                Rt[0] = gamma_inc[order*nsp_per_block];
+                if (order >= 1) {
+                    double _Rt_0 = Rt[0];
+                    Rt[1*nsp_per_block] = zpq * _Rt_0;
+                    Rt[2*nsp_per_block] = ypq * _Rt_0;
+                    Rt[3*nsp_per_block] = xpq * _Rt_0;
+                    Rt[0] = gamma_inc[(order-1)*nsp_per_block];
+                }
+                if (order >= 2) {
+                    double _Rt_0 = Rt[0];
+                    double _Rt_1 = Rt[1*nsp_per_block];
+                    double _Rt_2 = Rt[2*nsp_per_block];
+                    double _Rt_3 = Rt[3*nsp_per_block];
+                    Rt[1*nsp_per_block] = zpq * _Rt_0;
+                    Rt[2*nsp_per_block] = zpq * _Rt_1 + _Rt_0;
+                    Rt[3*nsp_per_block] = ypq * _Rt_0;
+                    Rt[4*nsp_per_block] = ypq * _Rt_1;
+                    Rt[5*nsp_per_block] = ypq * _Rt_2 + _Rt_0;
+                    Rt[6*nsp_per_block] = xpq * _Rt_0;
+                    Rt[7*nsp_per_block] = xpq * _Rt_1;
+                    Rt[8*nsp_per_block] = xpq * _Rt_2;
+                    Rt[9*nsp_per_block] = xpq * _Rt_3 + _Rt_0;
+                    Rt[0] = gamma_inc[(order-2)*nsp_per_block];
+                }
+                if (order >= 3) {
+                    double _Rt_0 = Rt[0];
+                    double _Rt_1 = Rt[1*nsp_per_block];
+                    double _Rt_2 = Rt[2*nsp_per_block];
+                    double _Rt_3 = Rt[3*nsp_per_block];
+                    double _Rt_4 = Rt[4*nsp_per_block];
+                    double _Rt_5 = Rt[5*nsp_per_block];
+                    double _Rt_6 = Rt[6*nsp_per_block];
+                    double _Rt_7 = Rt[7*nsp_per_block];
+                    double _Rt_8 = Rt[8*nsp_per_block];
+                    double _Rt_9 = Rt[9*nsp_per_block];
+                    Rt[1 *nsp_per_block] = zpq * _Rt_0;
+                    Rt[2 *nsp_per_block] = zpq * _Rt_1 + _Rt_0;
+                    Rt[3 *nsp_per_block] = zpq * _Rt_2 + _Rt_1 * 2;
+                    Rt[4 *nsp_per_block] = ypq * _Rt_0;
+                    Rt[5 *nsp_per_block] = ypq * _Rt_1;
+                    Rt[6 *nsp_per_block] = ypq * _Rt_2;
+                    Rt[7 *nsp_per_block] = ypq * _Rt_3 + _Rt_0;
+                    Rt[8 *nsp_per_block] = ypq * _Rt_4 + _Rt_1;
+                    Rt[9 *nsp_per_block] = ypq * _Rt_5 + _Rt_3 * 2;
+                    Rt[10*nsp_per_block] = xpq * _Rt_0;
+                    Rt[11*nsp_per_block] = xpq * _Rt_1;
+                    Rt[12*nsp_per_block] = xpq * _Rt_2;
+                    Rt[13*nsp_per_block] = xpq * _Rt_3;
+                    Rt[14*nsp_per_block] = xpq * _Rt_4;
+                    Rt[15*nsp_per_block] = xpq * _Rt_5;
+                    Rt[16*nsp_per_block] = xpq * _Rt_6 + _Rt_0;
+                    Rt[17*nsp_per_block] = xpq * _Rt_7 + _Rt_1;
+                    Rt[18*nsp_per_block] = xpq * _Rt_8 + _Rt_3;
+                    Rt[19*nsp_per_block] = xpq * _Rt_9 + _Rt_6 * 2;
+                    Rt[0] = gamma_inc[(order-3)*nsp_per_block];
+                }
+            }
+            for (int n = 4; n <= order; ++n) {
+                __syncthreads();
+                iter_Rt_n<RT_SIZE>(Rt, xpq, ypq, zpq, n, nsp_per_block, Rt_id, Rt_stride);
+                if (Rt_id == 0) {
+                    Rt[0] = gamma_inc[(order-n)*nsp_per_block];
+                }
+            }
+            __syncthreads();
+
+            double vj_xyz[nf3k];
+#pragma unroll
+            for (int n = 0; n < nf3k; ++n) {
+                vj_xyz[n] = 0;
+            }
+            if (pair_ij < shl_pair1) {
+                int ij_loc0 = pair_ij_loc[pair_ij];
+                double *dm = jk.dm + ij_loc0;
+                for (int i = Rt_id; i < nf3ij; i += Rt_stride) {
+                    double dm_ij = dm[i];
+#pragma unroll
+                    for (int k = 0; k < nf3k; k++) {
+                        int off = k * nf3ij;
+                        double s = Rt[p1_ij[off+i]*nsp_per_block];
+                        vj_xyz[k] += s * dm_ij;
+                    }
+                }
+            }
+#pragma unroll
+            for (int k = 0; k < nf3k; k++) {
+                vj_xyz[k] *= efg_phase[k];
+            }
+
+            __syncthreads();
+            double vj_aux[nfk];
+            _dot_Et<LK>(vj_aux, vj_xyz, ak);
+            int *ao_loc = envs.ao_loc;
+            int k0 = ao_loc[ksh] - ao_loc[envs.nbas];
+#pragma unroll
+            for (int k = 0; k < nfk; k++) {
+                shared_memory[thread_id] = vj_aux[k];
+                __syncthreads();
+                if (Rt_id == 0 && pair_ij < shl_pair1) {
+                    double val = 0;
+                    for (int r = 0; r < Rt_stride; r++) {
+                        val += shared_memory[r*nsp_per_block+sp_id];
+                    }
+                    atomicAdd(vj[pair_component[pair_ij]]+k0+k, val);
+                }
+                __syncthreads();
+            }
+        }
+    }
+}
+
 __global__ static
 void contract_int3c2e_kernel(RysIntEnvVars envs, JKMatrix jk,
                              int *shl_pair_offsets, uint32_t *bas_ij_idx,
@@ -550,6 +747,26 @@ void contract_int3c2e_kernel(RysIntEnvVars envs, JKMatrix jk,
     case 4: unrolled_contract_int3c2e<4,42>(envs, jk, shl_pair_offsets, bas_ij_idx, pair_ij_loc, nsp_lookup); break;
     case 5: unrolled_contract_int3c2e<5,42>(envs, jk, shl_pair_offsets, bas_ij_idx, pair_ij_loc, nsp_lookup); break;
     case 6: unrolled_contract_int3c2e<6,30>(envs, jk, shl_pair_offsets, bas_ij_idx, pair_ij_loc, nsp_lookup); break;
+    }
+}
+
+__global__ static
+void contract_int3c2e_multi_out_kernel(RysIntEnvVars envs, JKMatrix jk,
+                                       double **vj, int *pair_component,
+                                       int *shl_pair_offsets,
+                                       uint32_t *bas_ij_idx,
+                                       int *pair_ij_loc, int *nsp_lookup)
+{
+    int ksh = gridDim.x - blockIdx.x - 1 + envs.nbas;
+    int lk = envs.bas[ANG_OF + ksh*BAS_SLOTS];
+    switch (lk) {
+    case 0: unrolled_contract_int3c2e_multi_out<0,42>(envs, jk, vj, pair_component, shl_pair_offsets, bas_ij_idx, pair_ij_loc, nsp_lookup); break;
+    case 1: unrolled_contract_int3c2e_multi_out<1,42>(envs, jk, vj, pair_component, shl_pair_offsets, bas_ij_idx, pair_ij_loc, nsp_lookup); break;
+    case 2: unrolled_contract_int3c2e_multi_out<2,42>(envs, jk, vj, pair_component, shl_pair_offsets, bas_ij_idx, pair_ij_loc, nsp_lookup); break;
+    case 3: unrolled_contract_int3c2e_multi_out<3,42>(envs, jk, vj, pair_component, shl_pair_offsets, bas_ij_idx, pair_ij_loc, nsp_lookup); break;
+    case 4: unrolled_contract_int3c2e_multi_out<4,42>(envs, jk, vj, pair_component, shl_pair_offsets, bas_ij_idx, pair_ij_loc, nsp_lookup); break;
+    case 5: unrolled_contract_int3c2e_multi_out<5,42>(envs, jk, vj, pair_component, shl_pair_offsets, bas_ij_idx, pair_ij_loc, nsp_lookup); break;
+    case 6: unrolled_contract_int3c2e_multi_out<6,30>(envs, jk, vj, pair_component, shl_pair_offsets, bas_ij_idx, pair_ij_loc, nsp_lookup); break;
     }
 }
 
@@ -750,6 +967,207 @@ void contract_auxvec_kernel(RysIntEnvVars envs, JKMatrix jk,
     }
 }
 
+template <int LK, int IJ_SIZE, int RT_SIZE> __device__ inline
+void unroll_contract_auxvec_multi_in(RysIntEnvVars& envs, JKMatrix& jk,
+                                     double **auxvecs, int *pair_component,
+                                     int *shl_pair_offsets, int *ksh_offsets,
+                                     uint32_t *bas_ij_idx, int *pair_ij_loc,
+                                     int *aux_loc, int *nsp_lookup)
+{
+    int thread_id = threadIdx.x;
+    int *bas = envs.bas;
+    double *env = envs.env;
+    __shared__ int shl_pair0, shl_pair1;
+    __shared__ int ksh0, ksh1;
+    if (thread_id == 0) {
+        int sp_block_id = gridDim.x - blockIdx.x - 1;
+        int ksh_block_id = gridDim.y - blockIdx.y - 1;
+        ksh0 = ksh_offsets[ksh_block_id];
+        ksh1 = ksh_offsets[ksh_block_id+1];
+        shl_pair0 = shl_pair_offsets[sp_block_id];
+        shl_pair1 = shl_pair_offsets[sp_block_id+1];
+    }
+    __syncthreads();
+    int bas_ij0 = bas_ij_idx[shl_pair0];
+    int ish0 = bas_ij0 / envs.nbas;
+    int jsh0 = bas_ij0 % envs.nbas;
+    int li = bas[ANG_OF + ish0*BAS_SLOTS];
+    int lj = bas[ANG_OF + jsh0*BAS_SLOTS];
+    constexpr int lk = LK;
+    int lij = li + lj;
+    int order = lij + lk;
+    constexpr int nfk = (lk + 1) * (lk + 2) / 2;
+    constexpr int nf3k = nfk * (lk + 3) / 3;
+    int nf3ij = (lij+1)*(lij+2)*(lij+3) / 6;
+    __shared__ int nsp_per_block, Rt_stride;
+    if (thread_id == 0) {
+        nsp_per_block = nsp_lookup[lij*(L_AUX_MAX+1)+lk];
+        Rt_stride = blockDim.x / nsp_per_block;
+    }
+    __syncthreads();
+    int sp_id = thread_id % nsp_per_block;
+    int Rt_id = thread_id / nsp_per_block;
+    extern __shared__ double shared_memory[];
+    double *gamma_inc = shared_memory + sp_id;
+    double *auxvec_cache = shared_memory + (order+1) * nsp_per_block;
+    double *Rt = auxvec_cache + nf3k * nsp_per_block + sp_id;
+    double *auxvec_cache_sp = auxvec_cache + nf3k * sp_id;
+    uint16_t *p1_ij = Rt2_kl_ij + Rt2_idx_offsets[lij*RT2_MAX+lk];
+    int8_t *efg_phase = c_Rt2_efg_phase + Rt2_idx_offsets[lk];
+
+    for (int pair_ij = shl_pair0+sp_id; pair_ij < shl_pair1+sp_id; pair_ij += nsp_per_block) {
+        double vj_xyz[IJ_SIZE];
+#pragma unroll
+        for (int n = 0; n < IJ_SIZE; ++n) {
+            vj_xyz[n] = 0;
+        }
+        int bas_ij;
+        int component;
+        if (pair_ij < shl_pair1) {
+            bas_ij = bas_ij_idx[pair_ij];
+            component = pair_component[pair_ij];
+        } else {
+            bas_ij = bas_ij_idx[shl_pair0];
+            component = pair_component[shl_pair0];
+        }
+        double *auxvec = auxvecs[component];
+        int ish = bas_ij / envs.nbas;
+        int jsh = bas_ij % envs.nbas;
+        double ai = env[bas[ish*BAS_SLOTS+PTR_EXP]];
+        double aj = env[bas[jsh*BAS_SLOTS+PTR_EXP]];
+        double *ri = env + bas[ish*BAS_SLOTS+PTR_BAS_COORD];
+        double *rj = env + bas[jsh*BAS_SLOTS+PTR_BAS_COORD];
+        double aij = ai + aj;
+        double xij = (ai * ri[0] + aj * rj[0]) / aij;
+        double yij = (ai * ri[1] + aj * rj[1]) / aij;
+        double zij = (ai * ri[2] + aj * rj[2]) / aij;
+        for (int ksh = ksh0; ksh < ksh1; ++ksh) {
+            __syncthreads();
+            int k_loc0 = aux_loc[ksh - envs.nbas];
+            for (int k = Rt_id; k < nf3k; k += Rt_stride) {
+                auxvec_cache_sp[k] = efg_phase[k] * auxvec[k_loc0+k];
+            }
+            double *rk = env + bas[ksh*BAS_SLOTS+PTR_BAS_COORD];
+            double xpq = xij - rk[0];
+            double ypq = yij - rk[1];
+            double zpq = zij - rk[2];
+            double rr = xpq*xpq + ypq*ypq + zpq*zpq;
+            int expk = bas[ksh*BAS_SLOTS+PTR_EXP];
+            double ak = env[expk];
+            double theta = aij * ak / (aij + ak);
+            if (Rt_id == 0) {
+                double fac = PI_FAC/(aij*ak*sqrt(aij+ak));
+                if (pair_ij >= shl_pair1) {
+                    fac = 0;
+                }
+                boys_fn(gamma_inc, theta, rr, jk.omega, fac, order, 0, nsp_per_block);
+                Rt[0] = gamma_inc[order*nsp_per_block];
+                if (order >= 1) {
+                    double _Rt_0 = Rt[0];
+                    Rt[1*nsp_per_block] = zpq * _Rt_0;
+                    Rt[2*nsp_per_block] = ypq * _Rt_0;
+                    Rt[3*nsp_per_block] = xpq * _Rt_0;
+                    Rt[0] = gamma_inc[(order-1)*nsp_per_block];
+                }
+                if (order >= 2) {
+                    double _Rt_0 = Rt[0];
+                    double _Rt_1 = Rt[1*nsp_per_block];
+                    double _Rt_2 = Rt[2*nsp_per_block];
+                    double _Rt_3 = Rt[3*nsp_per_block];
+                    Rt[1*nsp_per_block] = zpq * _Rt_0;
+                    Rt[2*nsp_per_block] = zpq * _Rt_1 + _Rt_0;
+                    Rt[3*nsp_per_block] = ypq * _Rt_0;
+                    Rt[4*nsp_per_block] = ypq * _Rt_1;
+                    Rt[5*nsp_per_block] = ypq * _Rt_2 + _Rt_0;
+                    Rt[6*nsp_per_block] = xpq * _Rt_0;
+                    Rt[7*nsp_per_block] = xpq * _Rt_1;
+                    Rt[8*nsp_per_block] = xpq * _Rt_2;
+                    Rt[9*nsp_per_block] = xpq * _Rt_3 + _Rt_0;
+                    Rt[0] = gamma_inc[(order-2)*nsp_per_block];
+                }
+                if (order >= 3) {
+                    double _Rt_0 = Rt[0];
+                    double _Rt_1 = Rt[1*nsp_per_block];
+                    double _Rt_2 = Rt[2*nsp_per_block];
+                    double _Rt_3 = Rt[3*nsp_per_block];
+                    double _Rt_4 = Rt[4*nsp_per_block];
+                    double _Rt_5 = Rt[5*nsp_per_block];
+                    double _Rt_6 = Rt[6*nsp_per_block];
+                    double _Rt_7 = Rt[7*nsp_per_block];
+                    double _Rt_8 = Rt[8*nsp_per_block];
+                    double _Rt_9 = Rt[9*nsp_per_block];
+                    Rt[1 *nsp_per_block] = zpq * _Rt_0;
+                    Rt[2 *nsp_per_block] = zpq * _Rt_1 + _Rt_0;
+                    Rt[3 *nsp_per_block] = zpq * _Rt_2 + _Rt_1 * 2;
+                    Rt[4 *nsp_per_block] = ypq * _Rt_0;
+                    Rt[5 *nsp_per_block] = ypq * _Rt_1;
+                    Rt[6 *nsp_per_block] = ypq * _Rt_2;
+                    Rt[7 *nsp_per_block] = ypq * _Rt_3 + _Rt_0;
+                    Rt[8 *nsp_per_block] = ypq * _Rt_4 + _Rt_1;
+                    Rt[9 *nsp_per_block] = ypq * _Rt_5 + _Rt_3 * 2;
+                    Rt[10*nsp_per_block] = xpq * _Rt_0;
+                    Rt[11*nsp_per_block] = xpq * _Rt_1;
+                    Rt[12*nsp_per_block] = xpq * _Rt_2;
+                    Rt[13*nsp_per_block] = xpq * _Rt_3;
+                    Rt[14*nsp_per_block] = xpq * _Rt_4;
+                    Rt[15*nsp_per_block] = xpq * _Rt_5;
+                    Rt[16*nsp_per_block] = xpq * _Rt_6 + _Rt_0;
+                    Rt[17*nsp_per_block] = xpq * _Rt_7 + _Rt_1;
+                    Rt[18*nsp_per_block] = xpq * _Rt_8 + _Rt_3;
+                    Rt[19*nsp_per_block] = xpq * _Rt_9 + _Rt_6 * 2;
+                    Rt[0] = gamma_inc[(order-3)*nsp_per_block];
+                }
+            }
+            for (int n = 4; n <= order; ++n) {
+                __syncthreads();
+                iter_Rt_n<RT_SIZE>(Rt, xpq, ypq, zpq, n, nsp_per_block, Rt_id, Rt_stride);
+                if (Rt_id == 0) {
+                    Rt[0] = gamma_inc[(order-n)*nsp_per_block];
+                }
+            }
+            __syncthreads();
+
+            if (pair_ij < shl_pair1) {
+#pragma unroll
+                for (int n = 0, i = Rt_id; n < IJ_SIZE; ++n, i += Rt_stride) {
+                    if (i >= nf3ij) break;
+                    _dot_aux<LK>(vj_xyz[n], Rt, auxvec_cache_sp, p1_ij,
+                                 nf3ij, i, nsp_per_block);
+                }
+            }
+        }
+        if (pair_ij < shl_pair1) {
+#pragma unroll
+            for (int n = 0, i = Rt_id; n < IJ_SIZE; ++n, i += Rt_stride) {
+                if (i >= nf3ij) break;
+                int ij_loc0 = pair_ij_loc[pair_ij];
+                atomicAdd(jk.vj+ij_loc0+i, vj_xyz[n]);
+            }
+        }
+    }
+}
+
+__global__ static
+void contract_auxvec_multi_in_kernel(RysIntEnvVars envs, JKMatrix jk,
+                                     double **auxvecs, int *pair_component,
+                                     int *shl_pair_offsets, int *ksh_offsets,
+                                     uint32_t *bas_ij_idx, int *pair_ij_loc,
+                                     int *aux_loc, int *nsp_lookup)
+{
+    int ksh_block_id = gridDim.y - blockIdx.y - 1;
+    int ksh = ksh_offsets[ksh_block_id];
+    int lk = envs.bas[ANG_OF + ksh*BAS_SLOTS];
+    switch (lk) {
+    case 0: unroll_contract_auxvec_multi_in<0,35,35>(envs, jk, auxvecs, pair_component, shl_pair_offsets, ksh_offsets, bas_ij_idx, pair_ij_loc, aux_loc, nsp_lookup); break;
+    case 1: unroll_contract_auxvec_multi_in<1,21,35>(envs, jk, auxvecs, pair_component, shl_pair_offsets, ksh_offsets, bas_ij_idx, pair_ij_loc, aux_loc, nsp_lookup); break;
+    case 2: unroll_contract_auxvec_multi_in<2,15,35>(envs, jk, auxvecs, pair_component, shl_pair_offsets, ksh_offsets, bas_ij_idx, pair_ij_loc, aux_loc, nsp_lookup); break;
+    case 3: unroll_contract_auxvec_multi_in<3,11,35>(envs, jk, auxvecs, pair_component, shl_pair_offsets, ksh_offsets, bas_ij_idx, pair_ij_loc, aux_loc, nsp_lookup); break;
+    case 4: unroll_contract_auxvec_multi_in<4, 8,35>(envs, jk, auxvecs, pair_component, shl_pair_offsets, ksh_offsets, bas_ij_idx, pair_ij_loc, aux_loc, nsp_lookup); break;
+    case 5: unroll_contract_auxvec_multi_in<5, 8,21>(envs, jk, auxvecs, pair_component, shl_pair_offsets, ksh_offsets, bas_ij_idx, pair_ij_loc, aux_loc, nsp_lookup); break;
+    case 6: unroll_contract_auxvec_multi_in<6, 8,21>(envs, jk, auxvecs, pair_component, shl_pair_offsets, ksh_offsets, bas_ij_idx, pair_ij_loc, aux_loc, nsp_lookup); break;
+    }
+}
+
 extern "C" {
 // contract('ijP,ji->P', int3c2e, dm)
 int contract_int3c2e_dm(double *vj, double *dm, int n_dm, int naux,
@@ -768,6 +1186,30 @@ int contract_int3c2e_dm(double *vj, double *dm, int n_dm, int naux,
     cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) {
         fprintf(stderr, "CUDA Error in contract_int3c2e_dm, error message = %s\n", cudaGetErrorString(err));
+        return 1;
+    }
+    return 0;
+}
+
+// contract('ijP,ji->P', int3c2e, dm) into vj[pair_component[pair]]
+int contract_int3c2e_dm_multi_out(double **vj, double *dm, int n_dm, int naux,
+                                  RysIntEnvVars *envs, int shm_size,
+                                  int nbatches_shl_pair, int nksh,
+                                  int *pair_component, int *shl_pair_offsets,
+                                  uint32_t *bas_ij_idx, int *pair_ij_loc,
+                                  int *nsp_lookup, double omega)
+{
+    assert(n_dm == 1);
+    cudaFuncSetAttribute(contract_int3c2e_multi_out_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, shm_size);
+    JKMatrix jk = {NULL, NULL, dm, n_dm, 0, omega};
+    dim3 threads(THREADS);
+    dim3 blocks(nksh, nbatches_shl_pair);
+    contract_int3c2e_multi_out_kernel<<<blocks, threads, shm_size>>>(
+        *envs, jk, vj, pair_component, shl_pair_offsets, bas_ij_idx,
+        pair_ij_loc, nsp_lookup);
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        fprintf(stderr, "CUDA Error in contract_int3c2e_dm_multi_out, error message = %s\n", cudaGetErrorString(err));
         return 1;
     }
     return 0;
@@ -792,6 +1234,31 @@ int contract_int3c2e_auxvec(double *vj, double *auxvec, int n_dm, int naux,
     cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) {
         fprintf(stderr, "CUDA Error in contract_int3c2e_auxvec, error message = %s\n", cudaGetErrorString(err));
+        return 1;
+    }
+    return 0;
+}
+
+// contract('ijP,P->ij', int3c2e, auxvecs[pair_component[pair]])
+int contract_int3c2e_auxvec_multi_in(double *vj, double **auxvecs, int n_dm,
+                                     int naux, RysIntEnvVars *envs, int shm_size,
+                                     int nbatches_shl_pair, int nbatches_ksh,
+                                     int *pair_component, int *shl_pair_offsets,
+                                     int *ksh_offsets, uint32_t *bas_ij_idx,
+                                     int *pair_ij_loc, int *aux_loc,
+                                     int *nsp_lookup, double omega)
+{
+    assert(n_dm == 1);
+    cudaFuncSetAttribute(contract_auxvec_multi_in_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, shm_size);
+    JKMatrix jk = {vj, NULL, NULL, n_dm, 0, omega};
+    dim3 threads(THREADS);
+    dim3 blocks(nbatches_shl_pair, nbatches_ksh);
+    contract_auxvec_multi_in_kernel<<<blocks, threads, shm_size>>>(
+        *envs, jk, auxvecs, pair_component, shl_pair_offsets, ksh_offsets,
+        bas_ij_idx, pair_ij_loc, aux_loc, nsp_lookup);
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        fprintf(stderr, "CUDA Error in contract_int3c2e_auxvec_multi_in, error message = %s\n", cudaGetErrorString(err));
         return 1;
     }
     return 0;

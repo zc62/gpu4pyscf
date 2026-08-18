@@ -1,0 +1,917 @@
+import cupy
+import numpy
+from pyscf import gto
+from pyscf import lib as pyscf_lib
+from pyscf.data import nist
+from pyscf.neo import hf as hf_cpu
+from pyscf.scf import chkfile
+from gpu4pyscf import __config__
+from gpu4pyscf import scf as scf_gpu
+from gpu4pyscf import lib
+from gpu4pyscf.lib import logger, utils
+from gpu4pyscf.lib.cupy_helper import asarray, tag_array
+from gpu4pyscf.qmmm.itrf import _mm_charge_integrals
+
+
+WITH_META_LOWDIN = getattr(__config__, 'scf_analyze_with_meta_lowdin', True)
+
+
+# NEO stores SCF data in nested dict/list structures.  The generic GPU4PySCF
+# converters only convert top-level attributes, so conversion at the NEO
+# CPU/GPU boundary needs to recurse through these containers.
+def _to_cpu(x):
+    if isinstance(x, cupy.ndarray):
+        return x.get()
+    if isinstance(x, dict):
+        return {k: _to_cpu(v) for k, v in x.items()}
+    if isinstance(x, tuple):
+        return tuple(_to_cpu(v) for v in x)
+    if isinstance(x, list):
+        return [_to_cpu(v) for v in x]
+    return x
+
+
+def _to_gpu(x):
+    if isinstance(x, numpy.ndarray):
+        return cupy.asarray(x)
+    if isinstance(x, dict):
+        return {k: _to_gpu(v) for k, v in x.items()}
+    if isinstance(x, tuple):
+        return tuple(_to_gpu(v) for v in x)
+    if isinstance(x, list):
+        return [_to_gpu(v) for v in x]
+    return x
+
+
+def general_scf(method, charge=1, mass=1, is_nucleus=False, nuc_occ_state=0):
+    '''Modify SCF (HF and DFT) method to support for general charge
+    and general mass, such that positrons and nuclei can be calculated.
+
+    Args:
+        charge : float
+            Charge of the particle. 1 means electron, -1 means positron.
+        mass : float
+            Mass of the particle in a.u. Nuclei will have high mass
+        is_nucleus : bool
+            If the particle is nucleus. Nucleus won't see PP and is
+            considered a distinguishable single particle
+        nuc_occ_state : int
+            Select the nuclear orbital that is occupied. For Delta-SCF.
+    '''
+    assert isinstance(method, scf_gpu.hf.SCF)
+    if isinstance(method, Component):
+        method.charge = charge
+        method.mass = mass
+        method.is_nucleus = is_nucleus
+        method.nuc_occ_state = nuc_occ_state
+        method._vint = None
+        return method
+    return pyscf_lib.set_class(ComponentSCF(method, charge, mass, is_nucleus, nuc_occ_state),
+                               (ComponentSCF, method.__class__))
+
+
+class Component:
+    __name_mixin__ = 'Component'
+
+
+class ComponentSCF(Component):
+    _keys = {'charge', 'mass', 'is_nucleus', 'nuc_occ_state'}
+
+    def __init__(self, method, charge=1, mass=1, is_nucleus=False, nuc_occ_state=0):
+        self.__dict__.update(method.__dict__)
+        self.charge = charge
+        self.mass = mass
+        self.is_nucleus = is_nucleus
+        self.nuc_occ_state = nuc_occ_state
+        self._vint = None
+
+    def undo_component(self):
+        obj = pyscf_lib.view(self, pyscf_lib.drop_class(self.__class__, Component))
+        del obj.charge, obj.mass, obj.is_nucleus, obj.nuc_occ_state, obj._vint
+        return obj
+
+    def get_hcore(self, mol=None):
+        if mol is None:
+            mol = self.mol
+        from gpu4pyscf.pbc.gto.int1e import int1e_kin
+        if mol._pseudo and not self.is_nucleus:
+            from pyscf.gto import pp_int
+            vext = asarray(pp_int.get_gth_pp(mol)) * self.charge
+        else:
+            assert not mol.nucmod
+            from gpu4pyscf.df.int3c2e_bdiv import contract_int3c2e_auxvec
+            nucmol = gto.mole.fakemol_for_charges(mol.atom_coords())
+            Z = cupy.asarray(mol.atom_charges(), dtype=numpy.float64)
+            vext = contract_int3c2e_auxvec(mol, nucmol, -Z) * self.charge
+        h = vext + int1e_kin(mol) / self.mass
+
+        if len(mol._ecpbas) > 0 and not self.is_nucleus:
+            from gpu4pyscf.gto.ecp import get_ecp
+            h += get_ecp(mol) * self.charge
+
+        mm_mol = None
+        if hasattr(mol, 'super_mol'):
+            mm_mol = mol.super_mol.mm_mol
+        elif hasattr(mol, 'mm_mol'):
+            mm_mol = mol.mm_mol
+        if mm_mol is not None:
+            # Match GPU4PySCF qmmm.itrf: int1e_grids supports both point MM
+            # charges and Gaussian MM charges through charge_exponents.
+            from gpu4pyscf.gto.int3c1e import int1e_grids
+            h -= _mm_charge_integrals(mm_mol, mol, int1e_grids) * self.charge
+        return h
+
+    def get_veff(self, mol=None, dm=None, dm_last=None, vhf_last=None, hermi=1):
+        if mol is None:
+            mol = self.mol
+        with_ecoul = False
+        if self.is_nucleus: # Nucleus does not have self-type interaction
+            veff = cupy.zeros((mol.nao, mol.nao))
+            if isinstance(self, scf_gpu.hf.KohnShamDFT):
+                veff = tag_array(veff, ecoul=None, exc=0, vj=veff.copy())
+            else:
+                assert isinstance(self, scf_gpu.hf.RHF)
+                with_ecoul = isinstance(dm, cupy.ndarray) and dm.ndim == 2
+        else:
+            if abs(self.charge) != 1.:
+                raise NotImplementedError('General charge J/K with tag_array')
+            if not isinstance(self, scf_gpu.hf.KohnShamDFT) and mol.nelectron == 1:
+                # CPU HF1e is converted to UHF for GPU NEO. Skip its electronic
+                # self J/K while retaining the inter-component potential below.
+                if dm is None:
+                    dm = self.make_rdm1()
+                veff = cupy.zeros_like(cupy.asarray(dm))
+                # The omitted self J and K cancel; inter-component Coulomb is
+                # added below and remains available for energy decomposition.
+                veff = tag_array(veff, ecoul=0)
+            elif hasattr(vhf_last, 'vhf_self'):
+                veff = super().get_veff(mol, dm, dm_last, vhf_last.vhf_self, hermi)
+            else:
+                veff = super().get_veff(mol, dm, dm_last, vhf_last, hermi)
+            with_ecoul = hasattr(veff, 'ecoul')
+
+        if self._vint is None:
+            if hasattr(mol, 'super_mol'):
+                raise RuntimeError('ComponentSCF.get_veff cannot build the '
+                      'multicomponent effective potential without the inter-component '
+                      'cache. Call the parent NEO get_veff first, or pass a complete '
+                      'multicomponent vhf from the parent object.')
+        else:
+            # Save the self-type potential before adding inter-component terms.
+            # Native SCF incremental J/K should see this object as vhf_last,
+            # not the full NEO potential with _vint included.
+            vhf_self = asarray(veff).copy()
+            if hasattr(veff, '__dict__'):
+                vhf_self = tag_array(vhf_self, **veff.__dict__)
+                veff = tag_array(veff + self._vint, **veff.__dict__,
+                                 vhf_self=vhf_self, vint=self._vint)
+            else:
+                veff = tag_array(veff + self._vint, vhf_self=vhf_self,
+                                 vint=self._vint)
+            if not isinstance(self, scf_gpu.hf.KohnShamDFT) and with_ecoul:
+                dm_tot = cupy.asarray(dm)
+                if isinstance(self, scf_gpu.uhf.UHF) and dm_tot.ndim == 3:
+                    dm_tot = dm_tot[0] + dm_tot[1]
+                ecoul = cupy.einsum('ij,ji->', dm_tot, self._vint).real.item() * .5
+                if not self.is_nucleus:
+                    ecoul += vhf_self.ecoul
+                veff = tag_array(veff, ecoul=ecoul)
+        return veff
+
+    def get_occ(self, mo_energy=None, mo_coeff=None):
+        if mo_energy is None:
+            mo_energy = self.mo_energy
+        if self.is_nucleus:
+            if self.mol.symmetry:
+                raise NotImplementedError('Point-group symmetry for nuclear orbitals '
+                                          'is not implemented')
+            mo_energy = cupy.asarray(mo_energy)
+            mo_occ = cupy.zeros_like(mo_energy)
+            e_idx = cupy.argsort(mo_energy)
+            nmo = mo_energy.size
+            nocc = 1
+            if self.verbose >= logger.INFO and nocc < nmo:
+                homo, lumo = mo_energy[e_idx[nocc-1:nocc+1]].get()
+                gap = (lumo - homo) * nist.HARTREE2EV
+                self.scf_summary['gap'] = gap
+                if homo+1e-3 > lumo:
+                    logger.warn(self, 'CNEO NUC HOMO %.15g == LUMO %.15g', homo, lumo)
+                else:
+                    logger.info(self, '  CNEO NUC HOMO = %.15g  LUMO = %.15g  gap/eV = %.5f',
+                                homo, lumo, gap)
+            elif nocc > nmo:
+                raise RuntimeError(f'Failed to assign mo_occ. Nocc ({nocc}) > Nmo ({nmo})')
+            mo_occ[e_idx[self.nuc_occ_state]] = self.mol.nnuc
+            return mo_occ
+
+        # Electronic occupations use the parent GPU implementation unless
+        # fractional occupation was requested.
+        if self.mol.symmetry:
+            raise NotImplementedError('Point-group symmetry for electronic orbitals '
+                                      'is not implemented')
+        if self.mol.nhomo is None:
+            return super().get_occ(mo_energy, mo_coeff)
+        raise NotImplementedError('Fractional electronic occupation is not implemented')
+
+    def get_init_guess(self, mol=None, key='minao', **kwargs):
+        if self.is_nucleus:
+            return 0
+
+        # Build the electronic guess with the total molecular charge, then
+        # restore the component charge used by NEO interactions.
+        if mol is None:
+            mol = self.mol
+        charge = self.charge
+        self.charge = abs(charge)
+        dm = super().get_init_guess(mol.super_mol, key, **kwargs)
+        self.charge = charge
+        return dm
+
+    def scf(self, dm0=None, **kwargs):
+        raise AttributeError('scf should not be called from ComponentSCF')
+
+    def dip_moment(self, mol=None, dm=None, unit='Debye', origin=None,
+                   verbose=logger.NOTE, **kwargs):
+        if self.is_nucleus:
+            dm_cpu = _to_cpu(dm)
+            return hf_cpu.ComponentSCF.dip_moment(self, mol, dm_cpu, unit,
+                                                  origin, verbose, **kwargs)
+
+        # Evaluate the electronic dipole with the total molecular charge.
+        charge = self.mol.charge
+        self.mol.charge = self.mol.super_mol.charge
+        dip = super().dip_moment(mol, dm, unit, origin=origin,
+                                 verbose=verbose, **kwargs)
+        self.mol.charge = charge
+        return dip
+
+    def to_cpu(self):
+        obj = self.undo_component().to_cpu()
+        obj = hf_cpu.general_scf(obj, self.charge, self.mass, self.is_nucleus,
+                                 self.nuc_occ_state)
+        return utils.to_cpu(self, obj)
+
+    mulliken_pop = NotImplemented
+    mulliken_meta = NotImplemented
+
+
+class InteractionCoulomb(hf_cpu.InteractionCoulomb):
+    '''Inter-component Coulomb interactions.'''
+
+    def __init__(self, mf1_type, mf1, mf2_type, mf2, max_memory,
+                 direct_scf_tol):
+        super().__init__(mf1_type, mf1, mf2_type, mf2, max_memory,
+                         direct_scf_tol)
+        self.mf1_unrestricted = isinstance(self.mf1, scf_gpu.uhf.UHF)
+        self.mf2_unrestricted = isinstance(self.mf2, scf_gpu.uhf.UHF)
+
+
+def _tag_vint_full_delta(vint_full, vint_delta, components):
+    out = {}
+    for t in components:
+        out[t] = tag_array(vint_full[t] + vint_delta[t],
+                           vint_inc=vint_delta[t])
+    return out
+
+def get_fock(mf, h1e=None, s1e=None, vhf=None, dm=None, cycle=-1,
+             diis=None, diis_start_cycle=None, level_shift_factor=None,
+             damp_factor=None, fock_last=None, diis_pos='both', diis_type=3):
+    if h1e is None: h1e = mf.get_hcore()
+    if vhf is None: vhf = mf.get_veff(mf.mol, dm)
+    h1e = {t: cupy.asarray(h1e[t]) for t in h1e}
+    vhf = {t: cupy.asarray(vhf[t]) for t in vhf}
+    f = {}
+    for t, comp in mf.components.items():
+        f[t] = h1e[t] + vhf[t]
+        if not t.startswith('n') and isinstance(comp, scf_gpu.uhf.UHF) and f[t].ndim == 2:
+            f[t] = cupy.asarray((f[t],) * 2)
+
+    from gpu4pyscf.neo import cdft
+    is_cdft = isinstance(mf, cdft.CDFT)
+    f0 = None
+    # CNEO constraint term
+    # NOTE: even if not using DIIS, we still optimize f.
+    if is_cdft:
+        if diis_pos == 'pre' or diis_pos == 'both' or (cycle < 0 and diis is None):
+            # optimize the Lagrange multiplier in CNEO
+            for t, comp in mf.components.items():
+                if t.startswith('n'):
+                    ia = comp.mol.atom_index
+                    opt = cdft.solve_constraint(comp, _to_cpu(f[t]), _to_cpu(s1e[t]), mf.f[ia])
+                    mf.f[ia] = opt.x
+                    if opt.success:
+                        logger.debug(mf, 'CNEO NUC constraint optimization succeeded.')
+                        logger.debug(mf, 'Lagrange multiplier of %s(%i) atom: %s' %
+                                     (mf.mol.atom_symbol(ia), ia, mf.f[ia]))
+                        logger.debug(mf, 'Position deviation: %s', opt.fun)
+                    else:
+                        logger.warn(mf, 'CNEO NUC constraint optimization failed!')
+                        logger.warn(mf, f'scipy.optimize.least_squares message: {opt.message}')
+                        logger.warn(mf, 'Lagrange multiplier of %s(%i) atom: %s' %
+                                    (mf.mol.atom_symbol(ia), ia, mf.f[ia]))
+                        logger.warn(mf, 'Position deviation: %s', opt.fun)
+
+        # For DIIS type 1, preserve original matrices
+        if diis_type == 1:
+            f0 = f.copy()
+
+        fock_add = mf.get_fock_add_cdft()
+        for t in fock_add:
+            f[t] += fock_add[t]
+
+    if cycle < 0 and diis is None:
+        return f
+
+    if s1e is None: s1e = mf.get_ovlp()
+    if dm is None: dm = mf.make_rdm1()
+    s1e = {t: cupy.asarray(s1e[t]) for t in s1e}
+    dm = {t: cupy.asarray(dm[t]) for t in dm}
+    for t, comp in mf.components.items():
+        if not t.startswith('n') and isinstance(comp, scf_gpu.uhf.UHF) \
+                and isinstance(dm[t], cupy.ndarray) and dm[t].ndim == 2:
+            dm[t] = cupy.asarray((dm[t]*0.5,) * 2)
+
+    if diis_start_cycle is None:
+        diis_start_cycle = mf.diis_start_cycle
+    if damp_factor is None:
+        damp_factor = mf.damp
+    if damp_factor is not None and 0 <= cycle < diis_start_cycle-1 and fock_last is not None \
+            and abs(damp_factor) > 1e-12:
+        raise NotImplementedError('Damping for multi-component SCF is not yet implemented.')
+
+    if diis is not None and cycle >= diis_start_cycle:
+        if is_cdft:
+            keys = sorted(f.keys())
+            shapes = {k: f[k].shape for k in keys}
+            if getattr(diis, 'damp', 0):
+                raise NotImplementedError('DIIS damping for CDFT is not implemented.')
+            if diis_type == 1:
+                f0_flat = cupy.concatenate([f0[k].ravel() for k in keys])
+                # Type-1 CDFT extrapolates f0_flat while building the error
+                # vector from the constrained Fock.  Bypass CDIIS.update for
+                # this custom packed target/error-vector pair.
+                errvec = diis._sdf_err_vec(s1e, dm, f)
+                f_flat = lib.diis.DIIS.update(diis, f0_flat, xerr=errvec)
+            elif diis_type == 2:
+                f_flat = cupy.concatenate([f[k].ravel() for k in keys])
+                f_flat = lib.diis.DIIS.update(diis, f_flat)
+            elif diis_type == 3:
+                # Equivalent to packing f and calling
+                # lib.diis.DIIS.update(diis, f_flat, xerr=diis._sdf_err_vec(s1e, dm, f)).
+                f = diis.update(s1e, dm, f)
+                f_flat = None
+            else:
+                print("\nWARN: Unknow CDFT DIIS type, NO DIIS IS USED!!!\n")
+                f_flat = None
+
+            if f_flat is not None:
+                # The type 1/2 CDFT paths bypass CDIIS.update, so reproduce
+                # CDIIS' post-update rollback trimming after the raw DIIS call.
+                if diis.rollback > 0 and len(diis._bookkeep) == diis.space:
+                    diis._bookkeep = diis._bookkeep[-diis.rollback:]
+                # Reconstruct dictionary
+                offset = 0
+                f_new = {}
+                for k in keys:
+                    size = f[k].size
+                    f_new[k] = f_flat[offset:offset+size].reshape(shapes[k])
+                    offset += size
+                f = f_new
+
+            if diis_type == 1:
+                for t in fock_add:
+                    f[t] += fock_add[t]
+        else:
+            f = diis.update(s1e, dm, f)
+
+    if level_shift_factor is None:
+        level_shift_factor = mf.level_shift
+    if level_shift_factor is not None and abs(level_shift_factor) > 1e-12:
+        raise NotImplementedError('Level shift for multi-component SCF is not yet implemented.')
+
+    # Post-DIIS CDFT optimization
+    if is_cdft and (diis_pos == 'post' or diis_pos == 'both'):
+        f0 = {}
+        for t in f:
+            if t.startswith('n'):
+                f0[t] = f[t] - fock_add[t]
+            else:
+                f0[t] = f[t]
+
+        for t, comp in mf.components.items():
+            if t.startswith('n'):
+                ia = comp.mol.atom_index
+                opt = cdft.solve_constraint(comp, _to_cpu(f0[t]), _to_cpu(s1e[t]), mf.f[ia])
+                mf.f[ia] = opt.x
+                if opt.success:
+                    logger.debug(mf, 'CNEO NUC constraint optimization succeeded.')
+                    logger.debug(mf, 'Lagrange multiplier of %s(%i) atom: %s' %
+                                 (mf.mol.atom_symbol(ia), ia, mf.f[ia]))
+                    logger.debug(mf, 'Position deviation: %s', opt.fun)
+                else:
+                    logger.warn(mf, 'CNEO NUC constraint optimization failed!')
+                    logger.warn(mf, f'scipy.optimize.least_squares message: {opt.message}')
+                    logger.warn(mf, 'Lagrange multiplier of %s(%i) atom: %s' %
+                                (mf.mol.atom_symbol(ia), ia, mf.f[ia]))
+                    logger.warn(mf, 'Position deviation: %s', opt.fun)
+
+        fock_add = mf.get_fock_add_cdft()
+        for t in fock_add:
+            f[t] = f0[t] + fock_add[t]
+    return f
+
+
+def _kernel(mf, conv_tol=1e-10, conv_tol_grad=None,
+            dump_chk=True, dm0=None, callback=None, conv_check=True, **kwargs):
+    conv_tol = mf.conv_tol
+    mol = mf.mol
+    verbose = mf.verbose
+    log = logger.new_logger(mf, verbose)
+    t0 = t1 = log.init_timer()
+    if conv_tol_grad is None:
+        conv_tol_grad = conv_tol**.5
+        log.info('Set gradient conv threshold to %g', conv_tol_grad)
+
+    if dm0 is None:
+        dm0 = mf.get_init_guess(mol, mf.init_guess, **kwargs)
+        t1 = log.timer_debug1('generating initial guess', *t1)
+    else:
+        dm0 = mf.get_init_guess(mol, dm0, **kwargs)
+
+    e_dm = dm0.get('e') if isinstance(dm0, dict) else None
+    mo_coeff0 = mo_occ0 = None
+    if hasattr(e_dm, 'mo_coeff') and hasattr(e_dm, 'mo_occ'):
+        mo_coeff0 = cupy.asarray(e_dm.mo_coeff)
+        mo_occ0 = cupy.asarray(e_dm.mo_occ)
+    dm0 = {t: cupy.asarray(dm0[t], order='C') for t in dm0}
+    if mo_coeff0 is not None and mo_occ0 is not None:
+        dm0['e'] = tag_array(dm0['e'], mo_coeff=mo_coeff0, mo_occ=mo_occ0)
+
+    h1e = {t: cupy.asarray(v) for t, v in mf.get_hcore(mol).items()}
+    s1e = {t: cupy.asarray(v) for t, v in mf.get_ovlp(mol).items()}
+    t1 = log.timer_debug1('hcore', *t1)
+
+    dm, dm0 = dm0, None
+    vhf = mf.get_veff(mol, dm)
+    e_tot = mf.energy_tot(dm, h1e, vhf)
+    log.info('init E= %.15g', e_tot)
+    x_orth = mf.check_linear_dependency(s1e, log)
+    t1 = log.timer('SCF initialization', *t0)
+    scf_conv = False
+
+    # Skip SCF iterations. Compute only the total energy of the initial density
+    if mf.max_cycle <= 0:
+        fock = mf.get_fock(h1e, s1e, vhf, dm)  # = h1e + vhf, no DIIS
+        mo_energy, mo_coeff = mf.eig(fock, s1e, x=x_orth)
+        mo_occ = mf.get_occ(mo_energy, mo_coeff)
+        return scf_conv, e_tot, mo_energy, mo_coeff, mo_occ
+
+    if isinstance(mf.diis, lib.diis.DIIS):
+        mf_diis = mf.diis
+    elif mf.diis:
+        assert issubclass(mf.DIIS, lib.diis.DIIS)
+        mf_diis = mf.DIIS(mf, mf.diis_file)
+        mf_diis.space = mf.diis_space
+        mf_diis.rollback = mf.diis_space_rollback
+        mf_diis.damp = mf.diis_damp
+        mf_diis.Corth = _to_gpu(x_orth)
+    else:
+        mf_diis = None
+
+    dump_chk = dump_chk and mf.chkfile is not None
+    if dump_chk:
+        chkfile.save_mol(mol, mf.chkfile)
+
+    fock_last = None
+    mf.cycles = 0
+    for cycle in range(mf.max_cycle):
+        t0 = log.init_timer()
+        mo_coeff = mo_occ = mo_energy = fock = None
+        dm_last = dm
+        last_hf_e = e_tot
+
+        fock = mf.get_fock(h1e, s1e, vhf, dm, cycle, mf_diis, fock_last=fock_last)
+        t1 = log.timer_debug1('DIIS', *t0)
+        mo_energy, mo_coeff = mf.eig(fock, s1e, x=x_orth)
+        if mf.damp is not None:
+            fock_last = fock
+        fock = None
+        t1 = log.timer_debug1('eig', *t1)
+
+        mo_occ = mf.get_occ(mo_energy, mo_coeff)
+        dm = mf.make_rdm1(mo_coeff, mo_occ)
+        vhf = mf.get_veff(mol, dm, dm_last, vhf)
+        dm = {t: asarray(dm[t]) for t in dm} # Remove the attached attributes
+        t1 = log.timer_debug1('veff', *t1)
+
+        fock = mf.get_fock(h1e, s1e, vhf, dm)  # = h1e + vhf, no DIIS
+        e_tot = mf.energy_tot(dm, h1e, vhf)
+        grad = mf.get_grad(mo_coeff, mo_occ, fock)
+        norm_gorb = {t: cupy.linalg.norm(grad[t]) for t in grad}
+
+        norm_ddm = {t: cupy.linalg.norm(dm[t]-dm_last[t]) for t in dm}
+        t1 = log.timer(f'cycle={cycle+1}', *t0)
+
+        log.info('cycle= %d E= %.15g  delta_E= %4.3g  |g_e|= %4.3g  |ddm_e|= %4.3g',
+                 cycle+1, e_tot, e_tot-last_hf_e, norm_gorb['e'], norm_ddm['e'])
+        for t in grad:
+            if not t.startswith('e'):
+                log.info(f'    |g_{t}|= %4.3g  |ddm_{t}|= %4.3g',
+                         norm_gorb[t], norm_ddm[t])
+
+        if dump_chk:
+            mf.dump_chk(locals())
+
+        if callable(callback):
+            callback(locals())
+
+        e_diff = abs(e_tot-last_hf_e)
+        if (e_diff < conv_tol and norm_gorb['e'] < conv_tol_grad):
+            scf_conv = True
+            break
+    else:
+        log.warn("SCF failed to converge")
+
+    mf.cycles = cycle + 1
+    if scf_conv and mf.level_shift is not None:
+        # An extra diagonalization, to remove level shift
+        mo_energy, mo_coeff = mf.eig(fock, s1e, x=x_orth)
+        mo_occ = mf.get_occ(mo_energy, mo_coeff)
+        dm, dm_last = mf.make_rdm1(mo_coeff, mo_occ), dm
+        vhf = mf.get_veff(mol, dm, dm_last, vhf)
+        e_tot, last_hf_e = mf.energy_tot(dm, h1e, vhf), e_tot
+
+        fock = mf.get_fock(h1e, s1e, vhf, dm, level_shift_factor=0)
+        grad = mf.get_grad(mo_coeff, mo_occ, fock)
+        norm_gorb = {t: cupy.linalg.norm(grad[t]) for t in grad}
+        norm_ddm = {t: cupy.linalg.norm(dm[t]-dm_last[t]) for t in dm}
+
+        conv_tol = conv_tol * 10
+        conv_tol_grad = conv_tol_grad * 3
+        if abs(e_tot-last_hf_e) < conv_tol or norm_gorb['e'] < conv_tol_grad:
+            scf_conv = True
+        else:
+            log.warn("Level-shifted SCF extra cycle failed to converge")
+            scf_conv = False
+        log.info('Extra cycle  E= %.15g  delta_E= %4.3g  |g_e|= %4.3g  |ddm_e|= %4.3g',
+                 e_tot, e_tot-last_hf_e, norm_gorb['e'], norm_ddm['e'])
+        for t in grad:
+            if not t.startswith('e'):
+                log.info(f'    |g_{t}|= %4.3g  |ddm_{t}|= %4.3g',
+                         norm_gorb[t], norm_ddm[t])
+        if dump_chk:
+            mf.dump_chk(locals())
+
+    return scf_conv, e_tot, mo_energy, mo_coeff, mo_occ
+
+
+def scf(mf, dm0=None, **kwargs):
+    cput0 = logger.init_timer(mf)
+
+    mf.dump_flags()
+    mf.build(mf.mol)
+
+    if dm0 is None and mf.mo_coeff is not None and mf.mo_occ is not None:
+        # Initial guess from existing wavefunction
+        dm0 = mf.make_rdm1()
+
+    if mf.max_cycle > 0 or mf.mo_coeff is None:
+        mf.converged, mf.e_tot, \
+                mf.mo_energy, mf.mo_coeff, mf.mo_occ = \
+                _kernel(mf, mf.conv_tol, mf.conv_tol_grad,
+                        dm0=dm0, callback=mf.callback,
+                        conv_check=mf.conv_check, **kwargs)
+        for t, comp in mf.components.items():
+            comp.mo_energy = mf.mo_energy[t]
+            comp.mo_coeff = mf.mo_coeff[t]
+            comp.mo_occ = mf.mo_occ[t]
+            comp.converged = mf.converged
+    else:
+        # Avoid updating SCF orbitals in non-SCF initialization.
+        mf.e_tot = _kernel(mf, mf.conv_tol, mf.conv_tol_grad,
+                           dm0=dm0, callback=mf.callback,
+                           conv_check=mf.conv_check, **kwargs)[1]
+
+    logger.timer(mf, 'Multicomponent-SCF', *cput0)
+    mf._finalize()
+    return mf.e_tot
+
+
+def energy_tot(mf, dm=None, h1e=None, vhf=None):
+    nuc = mf.energy_nuc()
+    mf.scf_summary['nuc'] = nuc.real
+
+    e_tot = mf.energy_elec(dm, h1e, vhf)[0] + nuc
+    if mf.disp is not None:
+        mf.components['e'].disp = mf.disp
+    if mf.components['e'].do_disp():
+        if 'dispersion' in mf.components['e'].scf_summary:
+            e_tot += mf.components['e'].scf_summary['dispersion']
+        else:
+            e_disp = mf.components['e'].get_dispersion()
+            mf.components['e'].scf_summary['dispersion'] = e_disp
+            e_tot += e_disp
+        mf.scf_summary['dispersion'] = mf.components['e'].scf_summary['dispersion']
+
+    if isinstance(e_tot, cupy.ndarray):
+        e_tot = e_tot.get()
+    return e_tot
+
+
+class HF(scf_gpu.hf.SCF):
+    '''Multicomponent Hartree-Fock'''
+
+    _keys = scf_gpu.hf.SCF._keys.union({
+        'unrestricted', 'components', 'interactions',
+    })
+
+    def __init__(self, mol, unrestricted=False):
+        super().__init__(mol)
+        self.unrestricted = unrestricted
+        self.components = {}
+        for t, comp in self.mol.components.items():
+            if t.startswith('n'):
+                charge = -1. * self.mol.atom_charge(comp.atom_index)
+                mass = self.mol.mass[comp.atom_index] * nist.ATOMIC_MASS / nist.E_MASS
+                self.components[t] = general_scf(scf_gpu.RHF(comp), charge=charge, mass=mass,
+                                                 is_nucleus=True, nuc_occ_state=0)
+            else:
+                if self.unrestricted:
+                    mf = scf_gpu.UHF(comp)
+                elif getattr(comp, 'nhomo', None) is not None or comp.spin != 0:
+                    mf = scf_gpu.UHF(comp)
+                else:
+                    mf = scf_gpu.RHF(comp)
+                charge = -1. if t.startswith('p') else 1.
+                self.components[t] = general_scf(mf, charge=charge)
+        self.interactions = hf_cpu.generate_interactions(self.components, InteractionCoulomb,
+                                                         self.max_memory, self.direct_scf_tol)
+
+    get_fock = get_fock
+
+    def dump_flags(self, verbose=None):
+        super().dump_flags(verbose)
+        if self.mol.mm_mol is not None:
+            logger.info(self, '** Add background charges for %s **',
+                        self.__class__.__name__)
+        return self
+
+    check_linear_dependency = hf_cpu.HF.check_linear_dependency
+    check_sanity = hf_cpu.HF.check_sanity
+    build = hf_cpu.HF.build
+    eig = hf_cpu.HF.eig
+    # TODO: Batch component-local one-electron integrals without forming
+    # cross-component AO blocks.  The CPU helpers call each GPU component
+    # separately, giving O(ncomponent) kernel-launch overhead.
+    get_hcore = hf_cpu.HF.get_hcore
+    get_ovlp = hf_cpu.HF.get_ovlp
+    get_occ = hf_cpu.HF.get_occ
+    get_grad = hf_cpu.HF.get_grad
+    get_init_guess = hf_cpu.HF.get_init_guess
+
+    def _get_init_guess_vint(self, output_components, dm_guess):
+        dm_guess = _to_cpu(dm_guess)
+        vint = hf_cpu.HF._get_init_guess_vint(self, output_components, dm_guess)
+        return {t: cupy.asarray(v) for t, v in vint.items()}
+
+    make_rdm1 = hf_cpu.HF.make_rdm1
+    energy_elec = hf_cpu.HF.energy_elec
+    energy_tot = energy_tot
+    energy_nuc = hf_cpu.HF.energy_nuc
+    kernel = scf = scf
+    as_scanner = hf_cpu.as_scanner
+    mulliken_meta = pop = NotImplemented
+    mulliken_pop = NotImplemented
+    canonicalize = NotImplemented
+
+    def dump_chk(self, envs):
+        assert isinstance(envs, dict)
+        if self.chkfile:
+            chkfile.dump_scf(self.mol, self.chkfile, envs['e_tot'],
+                             _to_cpu(envs['mo_energy']),
+                             _to_cpu(envs['mo_coeff']),
+                             _to_cpu(envs['mo_occ']), overwrite_mol=False)
+
+    def get_jk(self, mol=None, dm=None, hermi=1, with_j=True, with_k=True,
+               omega=None):
+        raise AttributeError('get_jk should not be called from multi-component SCF')
+
+    def get_j(self, mol=None, dm=None, hermi=1, omega=None):
+        raise AttributeError('get_j should not be called from multi-component SCF')
+
+    def get_k(self, mol=None, dm=None, hermi=1, omega=None):
+        raise AttributeError('get_k should not be called from multi-component SCF')
+
+    def nuc_grad_method(self):
+        return self.Gradients()
+
+    def Gradients(self):
+        from gpu4pyscf.neo import grad
+        return grad.Gradients(self)
+
+    def get_veff(self, mol=None, dm=None, dm_last=None, vhf_last=None, hermi=1):
+        if mol is None:
+            mol = self.mol
+        if dm is None:
+            dm = self.make_rdm1()
+        vint = self._get_vint(mol, dm, dm_last, vhf_last)
+        vhf = {}
+        for t, comp in self.components.items():
+            dm_last_t = dm_last[t] if isinstance(dm_last, dict) else None
+            vhf_last_t = vhf_last[t] if isinstance(vhf_last, dict) else None
+            vint_coul = vint[t].vj if hasattr(vint[t], 'vj') else vint[t]
+            vint_exc = vint[t].exc if hasattr(vint[t], 'exc') else 0
+            vint_inc = getattr(vint[t], 'vint_inc', 0)
+            comp._vint = cupy.asarray(vint[t])
+            vhf[t] = comp.get_veff(mol.components[t], dm[t], dm_last_t,
+                                   vhf_last_t, hermi)
+            if isinstance(comp, scf_gpu.hf.KohnShamDFT):
+                vhf_self = vhf[t].vhf_self
+                # Include the intercomponent EPC contribution in the
+                # exchange-correlation energy tag.
+                exc = vhf_self.exc + vint_exc
+                ecoul = vhf_self.ecoul
+                # Add the intercomponent Coulomb energy for ground-state DMs.
+                dm_t = dm[t]
+                if comp.is_nucleus:
+                    ground_state = (isinstance(dm_t, cupy.ndarray) and dm_t.ndim == 2)
+                else:
+                    ground_state = ecoul is not None
+                if ground_state:
+                    if isinstance(comp, scf_gpu.uhf.UHF):
+                        if not isinstance(dm_t, cupy.ndarray):
+                            dm_t = asarray(dm_t)
+                        if dm_t.ndim == 2:  # RHF DM
+                            dm_tot = dm_t
+                        else:
+                            dm_tot = dm_t[0] + dm_t[1]
+                    else:
+                        dm_tot = dm_t
+                    ecoul_vint = cupy.einsum('ij,ji->', dm_tot, vint_coul).real.item() * .5
+                    if ecoul is not None:
+                        ecoul += ecoul_vint
+                    elif comp.is_nucleus:
+                        ecoul = ecoul_vint
+                    else:
+                        raise RuntimeError(
+                            f'Missing self Coulomb energy tag for component {t}')
+                tags = {'ecoul': ecoul, 'exc': exc, 'vhf_self': vhf_self,
+                        'vint': comp._vint, 'vint_inc': vint_inc}
+                if hasattr(vhf_self, 'vj'):
+                    tags['vj'] = vhf_self.vj + vint_coul
+                vhf[t] = tag_array(vhf[t], **tags)
+            else:
+                vhf[t] = tag_array(vhf[t], vint_inc=vint_inc)
+        return vhf
+
+    def _get_vint(self, mol=None, dm=None, dm_last=None, vhf_last=None,
+                  **kwargs):
+        if mol is None:
+            mol = self.mol
+        if dm is None:
+            dm = self.make_rdm1()
+        incremental_j = self.direct_scf and isinstance(dm_last, dict) \
+            and isinstance(vhf_last, dict) and \
+            all(t in vhf_last and hasattr(vhf_last[t], 'vint_inc') for t in self.components)
+        vint_full, vint_delta = hf_cpu._init_vint_full_delta(self.components,
+                                                             vhf_last,
+                                                             incremental_j)
+        dm_cpu = None
+        ddm_cpu = None
+        vint_full_cpu = None
+        vint_delta_cpu = None
+        for t_pair, interaction in self.interactions.items():
+            incremental_vint = interaction._is_direct_vint()
+            if incremental_vint and incremental_j:
+                if ddm_cpu is None:
+                    ddm = {}
+                    for t, dm_ in dm.items():
+                        ddm[t] = cupy.asarray(dm_) - cupy.asarray(dm_last[t])
+                    ddm_cpu = _to_cpu(ddm)
+                dm_interaction = ddm_cpu
+            else:
+                if dm_cpu is None:
+                    dm_cpu = _to_cpu(dm)
+                dm_interaction = dm_cpu
+            if incremental_vint:
+                if vint_delta_cpu is None:
+                    vint_delta_cpu = _to_cpu(vint_delta)
+                    vint_delta = vint_delta_cpu
+            else:
+                if vint_full_cpu is None:
+                    vint_full_cpu = _to_cpu(vint_full)
+                    vint_full = vint_full_cpu
+            v = interaction.get_vint(dm_interaction)
+            hf_cpu._accumulate_vint(vint_full, vint_delta, v, t_pair,
+                                    incremental_vint)
+        for t in self.components:
+            if isinstance(vint_full[t], numpy.ndarray):
+                vint_full[t] = cupy.asarray(vint_full[t])
+            if isinstance(vint_delta[t], numpy.ndarray):
+                vint_delta[t] = cupy.asarray(vint_delta[t])
+        return _tag_vint_full_delta(vint_full, vint_delta, self.components)
+
+    def analyze(self, verbose=None, with_meta_lowdin=WITH_META_LOWDIN,
+                **kwargs):
+        return self.to_cpu().analyze(verbose=verbose,
+                                     with_meta_lowdin=with_meta_lowdin,
+                                     **kwargs)
+
+    def dip_moment(self, mol=None, dm=None, unit='Debye', origin=None,
+                   verbose=logger.NOTE, **kwargs):
+        return self.to_cpu().dip_moment(mol, _to_cpu(dm), unit, origin,
+                                        verbose, **kwargs)
+
+    def density_fit(self, auxbasis=None, with_df=None, ee_only_dfj=False,
+                    df_ne=True, df_nn=False, df_ne_scheme='global',
+                    nuc_auxbasis=None, nuc_auxbasis_beta=2.0,
+                    nuc_auxbasis_lmax=None,
+                    df_ne_component_vint=False, df_ne_j_engine='direct'):
+        from gpu4pyscf.neo import df
+        return df.density_fit(self, auxbasis=auxbasis, with_df=with_df,
+                              ee_only_dfj=ee_only_dfj, df_ne=df_ne,
+                              df_nn=df_nn, df_ne_scheme=df_ne_scheme,
+                              nuc_auxbasis=nuc_auxbasis,
+                              nuc_auxbasis_beta=nuc_auxbasis_beta,
+                              nuc_auxbasis_lmax=nuc_auxbasis_lmax,
+                              df_ne_component_vint=df_ne_component_vint,
+                              df_ne_j_engine=df_ne_j_engine)
+
+    def _finalize(self):
+        super()._finalize()
+        if self.mol.symmetry or any(getattr(comp.mol, 'symmetry', False)
+                                    for comp in self.components.values()):
+            logger.warn(self, 'GPU NEO symmetry support is incomplete; '
+                        '_finalize still uses vanilla GPU orbital ordering')
+        return self
+
+    def copy(self):
+        new = super().copy()
+        if hasattr(self, 'f') and self.f is not None:
+            new.f = numpy.array(self.f, copy=True)
+        new.components = {}
+        for t, comp in self.components.items():
+            new.components[t] = general_scf(comp.undo_component().copy(), charge=comp.charge,
+                                            mass=comp.mass, is_nucleus=comp.is_nucleus,
+                                            nuc_occ_state=comp.nuc_occ_state)
+        new.interactions = hf_cpu.generate_interactions(new.components, InteractionCoulomb,
+                                                        new.max_memory, new.direct_scf_tol)
+        return new
+
+    def reset(self, mol=None):
+        if mol is not None:
+            self.mol = mol
+        super().reset(mol=mol)
+        if sorted(self.components.keys()) == sorted(self.mol.components.keys()):
+            for t, comp in self.components.items():
+                comp.reset(self.mol.components[t])
+                comp._vint = None
+            for interaction in self.interactions.values():
+                interaction._eri = None
+                interaction._vhfopt = None
+        else:
+            self.components.clear()
+            for t, comp in self.mol.components.items():
+                if t.startswith('n'):
+                    charge = -1. * self.mol.atom_charge(comp.atom_index)
+                    mass = self.mol.mass[comp.atom_index] * nist.ATOMIC_MASS / nist.E_MASS
+                    self.components[t] = general_scf(scf_gpu.RHF(comp), charge=charge, mass=mass,
+                                                     is_nucleus=True, nuc_occ_state=0)
+                else:
+                    if self.unrestricted:
+                        mf = scf_gpu.UHF(comp)
+                    elif getattr(comp, 'nhomo', None) is not None or comp.spin != 0:
+                        mf = scf_gpu.UHF(comp)
+                    else:
+                        mf = scf_gpu.RHF(comp)
+                    charge = -1. if t.startswith('p') else 1.
+                    self.components[t] = general_scf(mf, charge=charge)
+            self.interactions.clear()
+            self.interactions.update(hf_cpu.generate_interactions(
+                self.components, InteractionCoulomb,
+                self.max_memory, self.direct_scf_tol))
+        return self
+
+    def to_cpu(self):
+        obj = hf_cpu.HF(self.mol, unrestricted=self.unrestricted)
+        for key in self._keys:
+            if key in ('components', 'interactions'):
+                continue
+            if hasattr(self, key):
+                setattr(obj, key, _to_cpu(getattr(self, key)))
+        obj.components = {t: comp.to_cpu() for t, comp in self.components.items()}
+        obj.interactions = hf_cpu.generate_interactions(obj.components, hf_cpu.InteractionCoulomb,
+                                                        obj.max_memory, obj.direct_scf_tol)
+        return obj
+
+
+def from_cpu(mf):
+    out = HF(mf.mol, unrestricted=mf.unrestricted)
+    for key, val in mf.__dict__.items():
+        if key in ('components', 'interactions'):
+            continue
+        setattr(out, key, _to_gpu(val))
+    out.components = {t: comp.to_gpu() for t, comp in mf.components.items()}
+    out.interactions = hf_cpu.generate_interactions(out.components, InteractionCoulomb,
+                                                    out.max_memory, out.direct_scf_tol)
+    return out

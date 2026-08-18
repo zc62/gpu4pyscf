@@ -28,10 +28,12 @@
 #define Ey_at(i,j,t)    Ey[(i)*5+(j)+(t)*25]
 #define Ez_at(i,j,t)    Ez[(i)*5+(j)+(t)*25]
 
+template <bool multi_in>
 __global__ static
 void dm_to_Rt_kernel(double *out, double *dm, int n_dm, RysIntEnvVars envs,
                      uint32_t *bas_ij_idx, int *pair_loc, int npairs,
-                     int *ao_loc)
+                     int *ao_loc, double **dms, int *local_ao_loc,
+                     int *component_id, int *component_nao)
 {
     int pair_ij = blockIdx.x * blockDim.x + threadIdx.x; 
     if (pair_ij >= npairs) {
@@ -43,6 +45,7 @@ void dm_to_Rt_kernel(double *out, double *dm, int n_dm, RysIntEnvVars envs,
     uint32_t bas_ij = bas_ij_idx[pair_ij];
     int ish = bas_ij / nbas;
     int jsh = bas_ij % nbas;
+    int component = multi_in ? component_id[ish] : 0;
     int li = bas[ish*BAS_SLOTS+ANG_OF];
     int lj = bas[jsh*BAS_SLOTS+ANG_OF];
     int ri = bas[ish*BAS_SLOTS+PTR_BAS_COORD];
@@ -76,9 +79,12 @@ void dm_to_Rt_kernel(double *out, double *dm, int n_dm, RysIntEnvVars envs,
         cc *= .5;
     }
     double *Rt = out + pair_loc[pair_ij];
-    int i0 = ao_loc[ish];
-    int j0 = ao_loc[jsh];
-    size_t Nao = ao_loc[nbas];
+    int i0 = multi_in ? local_ao_loc[ish] : ao_loc[ish];
+    int j0 = multi_in ? local_ao_loc[jsh] : ao_loc[jsh];
+    size_t Nao = multi_in ? component_nao[component] : ao_loc[nbas];
+    if (multi_in) {
+        dm = dms[component];
+    }
     dm += i0 * Nao + j0;
     size_t dm_xyz_size = pair_loc[npairs];
     size_t Nao2 = Nao * Nao;
@@ -170,10 +176,12 @@ void dm_to_Rt_kernel(double *out, double *dm, int n_dm, RysIntEnvVars envs,
     }
 }
 
+template <bool multi_out>
 __global__ static
 void Rt_to_dm_kernel(double *dm, double *Rt, int n_dm, RysIntEnvVars envs,
                      uint32_t *bas_ij_idx, int *pair_loc, int npairs,
-                     int *ao_loc)
+                     int *ao_loc, double **dms, int *local_ao_loc,
+                     int *component_id, int *component_nao)
 {
     int pair_ij = blockIdx.x * blockDim.x + threadIdx.x; 
     if (pair_ij >= npairs) {
@@ -185,6 +193,7 @@ void Rt_to_dm_kernel(double *dm, double *Rt, int n_dm, RysIntEnvVars envs,
     uint32_t bas_ij = bas_ij_idx[pair_ij];
     int ish = bas_ij / nbas;
     int jsh = bas_ij % nbas;
+    int component = multi_out ? component_id[ish] : 0;
     int li = bas[ish*BAS_SLOTS+ANG_OF];
     int lj = bas[jsh*BAS_SLOTS+ANG_OF];
     int ri = bas[ish*BAS_SLOTS+PTR_BAS_COORD];
@@ -218,9 +227,12 @@ void Rt_to_dm_kernel(double *dm, double *Rt, int n_dm, RysIntEnvVars envs,
         cc *= .5;
     }
     Rt += pair_loc[pair_ij];
-    int i0 = ao_loc[ish];
-    int j0 = ao_loc[jsh];
-    size_t Nao = ao_loc[nbas];
+    int i0 = multi_out ? local_ao_loc[ish] : ao_loc[ish];
+    int j0 = multi_out ? local_ao_loc[jsh] : ao_loc[jsh];
+    size_t Nao = multi_out ? component_nao[component] : ao_loc[nbas];
+    if (multi_out) {
+        dm = dms[component];
+    }
     dm += i0 * Nao + j0;
     size_t dm_xyz_size = pair_loc[npairs];
     size_t Nao2 = Nao * Nao;
@@ -487,7 +499,9 @@ int dm_to_Rt(double *out, double *dm, int n_dm, RysIntEnvVars *envs,
              uint32_t *bas_ij_idx, int *pair_loc, int npairs, int *ao_loc)
 {
     int blocks = (npairs + THREADS - 1) / THREADS;
-    dm_to_Rt_kernel<<<blocks, THREADS>>>(out, dm, n_dm, *envs, bas_ij_idx, pair_loc, npairs, ao_loc);
+    dm_to_Rt_kernel<false><<<blocks, THREADS>>>(
+        out, dm, n_dm, *envs, bas_ij_idx, pair_loc, npairs, ao_loc,
+        NULL, NULL, NULL, NULL);
     cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) {
         fprintf(stderr, "CUDA Error in dm_to_Rt_kernel: %s\n", cudaGetErrorString(err));
@@ -500,10 +514,46 @@ int Rt_to_dm(double *dm, double *Rt, int n_dm, RysIntEnvVars *envs,
              uint32_t *bas_ij_idx, int *pair_loc, int npairs, int *ao_loc)
 {
     int blocks = (npairs + THREADS - 1) / THREADS;
-    Rt_to_dm_kernel<<<blocks, THREADS>>>(dm, Rt, n_dm, *envs, bas_ij_idx, pair_loc, npairs, ao_loc);
+    Rt_to_dm_kernel<false><<<blocks, THREADS>>>(
+        dm, Rt, n_dm, *envs, bas_ij_idx, pair_loc, npairs, ao_loc,
+        NULL, NULL, NULL, NULL);
     cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) {
         fprintf(stderr, "CUDA Error in Rt_to_dm_kernel: %s\n", cudaGetErrorString(err));
+        return 1;
+    }
+    return 0;
+}
+
+// Transform each shell pair from dms[component_id[ish]].
+int dm_to_Rt_multi_in(double *out, double **dms, int n_dm, RysIntEnvVars *envs,
+                      uint32_t *bas_ij_idx, int *pair_loc, int npairs,
+                      int *local_ao_loc, int *component_id, int *component_nao)
+{
+    int blocks = (npairs + THREADS - 1) / THREADS;
+    dm_to_Rt_kernel<true><<<blocks, THREADS>>>(
+        out, NULL, n_dm, *envs, bas_ij_idx, pair_loc, npairs, NULL,
+        dms, local_ao_loc, component_id, component_nao);
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        fprintf(stderr, "CUDA Error in dm_to_Rt_multi_in: %s\n", cudaGetErrorString(err));
+        return 1;
+    }
+    return 0;
+}
+
+// Scatter each shell pair to dms[component_id[ish]].
+int Rt_to_dm_multi_out(double **dms, double *Rt, int n_dm, RysIntEnvVars *envs,
+                       uint32_t *bas_ij_idx, int *pair_loc, int npairs,
+                       int *local_ao_loc, int *component_id, int *component_nao)
+{
+    int blocks = (npairs + THREADS - 1) / THREADS;
+    Rt_to_dm_kernel<true><<<blocks, THREADS>>>(
+        NULL, Rt, n_dm, *envs, bas_ij_idx, pair_loc, npairs, NULL,
+        dms, local_ao_loc, component_id, component_nao);
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        fprintf(stderr, "CUDA Error in Rt_to_dm_multi_out: %s\n", cudaGetErrorString(err));
         return 1;
     }
     return 0;

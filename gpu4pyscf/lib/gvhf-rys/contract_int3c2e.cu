@@ -114,10 +114,14 @@ void _store_vj(double *out, double *vj_cache, int li, int lj, size_t nao,
     }
 }
 
+template <bool componentwise>
 __global__ static
 void contract_int3c2e_dm_kernel(double *out, double *dm, int n_dm, int naux,
                                 RysIntEnvVars envs, int *shl_pair_offsets,
-                                uint32_t *bas_ij_idx, int *gout_stride_lookup)
+                                uint32_t *bas_ij_idx, int *gout_stride_lookup,
+                                double **component_out, double **component_dm,
+                                int *pair_component, int *local_ao_loc,
+                                int *component_nao)
 {
     int thread_id = threadIdx.x;
     int nbas = envs.nbas;
@@ -164,7 +168,12 @@ void contract_int3c2e_dm_kernel(double *out, double *dm, int n_dm, int naux,
     int gout_id = thread_id / nst_per_block;
     int sp_id = thread_id % nst_per_block;
 
-    size_t nao = ao_loc[nbas];
+    int component = componentwise ? pair_component[shl_pair0] : 0;
+    size_t nao = componentwise ? component_nao[component] : ao_loc[nbas];
+    if (componentwise) {
+        out = component_out[component];
+        dm = component_dm[component];
+    }
     int nfi = c_nf[li];
     int nfj = c_nf[lj];
     int nfk = c_nf[lk];
@@ -214,8 +223,8 @@ while (dm_id0 < n_dm) {
         }
         int ish = bas_ij / nbas;
         int jsh = bas_ij % nbas;
-        uint32_t i0 = ao_loc[ish];
-        uint32_t j0 = ao_loc[jsh];
+        uint32_t i0 = componentwise ? local_ao_loc[ish] : ao_loc[ish];
+        uint32_t j0 = componentwise ? local_ao_loc[jsh] : ao_loc[jsh];
         size_t dm_off = (dm_id0 * nao + j0) * nao + i0;
         int expi = bas[ish*BAS_SLOTS+PTR_EXP];
         int expj = bas[jsh*BAS_SLOTS+PTR_EXP];
@@ -561,13 +570,36 @@ int contract_int3c2e_dm(double *out, double *dm, int n_dm, int naux,
                         int nbas_aux, int nbatches_shl_pair, int *shl_pair_offsets,
                         uint32_t *bas_ij_idx, int *gout_stride_lookup)
 {
-    cudaFuncSetAttribute(contract_int3c2e_dm_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, shm_size);
+    cudaFuncSetAttribute(contract_int3c2e_dm_kernel<false>, cudaFuncAttributeMaxDynamicSharedMemorySize, shm_size);
     dim3 blocks(nbas_aux, nbatches_shl_pair);
-    contract_int3c2e_dm_kernel<<<blocks, THREADS, shm_size>>>(
-            out, dm, n_dm, naux, *envs, shl_pair_offsets, bas_ij_idx, gout_stride_lookup);
+    contract_int3c2e_dm_kernel<false><<<blocks, THREADS, shm_size>>>(
+            out, dm, n_dm, naux, *envs, shl_pair_offsets, bas_ij_idx,
+            gout_stride_lookup, NULL, NULL, NULL, NULL, NULL);
     cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) {
         fprintf(stderr, "CUDA Error in contract_int3c2e_dm: %s\n", cudaGetErrorString(err));
+        return 1;
+    }
+    return 0;
+}
+
+// Contract component-local density matrices to component-local auxiliary vectors.
+int contract_int3c2e_dm_multi_inout(double **out, double **dm, int n_dm, int naux,
+                                    RysIntEnvVars *envs, int shm_size,
+                                    int nbas_aux, int nbatches_shl_pair,
+                                    int *shl_pair_offsets, uint32_t *bas_ij_idx,
+                                    int *gout_stride_lookup, int *pair_component,
+                                    int *local_ao_loc, int *component_nao)
+{
+    cudaFuncSetAttribute(contract_int3c2e_dm_kernel<true>, cudaFuncAttributeMaxDynamicSharedMemorySize, shm_size);
+    dim3 blocks(nbas_aux, nbatches_shl_pair);
+    contract_int3c2e_dm_kernel<true><<<blocks, THREADS, shm_size>>>(
+            NULL, NULL, n_dm, naux, *envs, shl_pair_offsets, bas_ij_idx,
+            gout_stride_lookup, out, dm, pair_component, local_ao_loc,
+            component_nao);
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        fprintf(stderr, "CUDA Error in contract_int3c2e_dm_multi_inout: %s\n", cudaGetErrorString(err));
         return 1;
     }
     return 0;

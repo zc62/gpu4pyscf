@@ -31,6 +31,9 @@
 
 #include "unrolled_ejk_int3c2e_ip1.cu"
 
+// The componentwise specialization selects component-local J inputs while the
+// original specialization retains the existing dense-DM path.
+template <bool componentwise>
 __global__ static
 void sum_ejk_int3c2e_ip1_kernel(double *ejk, double *ejk_aux,
                             double *dm, double *density_auxvec, int n_dm,
@@ -38,7 +41,10 @@ void sum_ejk_int3c2e_ip1_kernel(double *ejk, double *ejk_aux,
                             double omega, double lr_factor, double sr_factor,
                             int *shl_pair_offsets, uint32_t *bas_ij_idx,
                             int *ksh_offsets, int *gout_stride_lookup,
-                            int *ao_pair_loc, int aux_offset, int naux)
+                            int *ao_pair_loc, int aux_offset, int naux,
+                            double **component_dm, double **component_auxvec,
+                            int *pair_component, int *local_ao_loc,
+                            int *component_nao)
 {
     // For better load balance, consume blocks in the reversed order
     int thread_id = threadIdx.x;
@@ -92,12 +98,13 @@ void sum_ejk_int3c2e_ip1_kernel(double *ejk, double *ejk_aux,
     }
     __syncthreads();
     if (n_dm == 1 &&
-        int3c2e_ip1_unrolled(ejk, ejk_aux, dm, density_auxvec,
+        int3c2e_ip1_unrolled<componentwise>(ejk, ejk_aux, dm, density_auxvec,
             omega, lr_factor, sr_factor, envs,
             shl_pair0, shl_pair1, ksh0, ksh1,
             iprim, jprim, kprim, li, lj, lk,
             bas_ij_idx, ao_pair_loc,
-            aux_offset, naux, nao, thread_id, shared_memory)) {
+            aux_offset, naux, nao, thread_id, shared_memory, component_dm,
+            component_auxvec, pair_component, local_ao_loc, component_nao)) {
         return;
     }
     register int gout_id = thread_id / nst_per_block;
@@ -154,7 +161,29 @@ void sum_ejk_int3c2e_ip1_kernel(double *ejk, double *ejk_aux,
             int rk = bas[ksh*BAS_SLOTS+PTR_BAS_COORD];
             double dm_tensor[GOUT_WIDTH];
             if (pair_ij < shl_pair1 && kidx < ksh1) {
-                if (density_auxvec == NULL) {
+                if (componentwise) {
+                    int component = pair_component[pair_ij];
+                    int nao_local = component_nao[component];
+                    int nfi = c_nf[li];
+                    int nfj = c_nf[lj];
+                    int i0 = local_ao_loc[ish];
+                    int j0 = local_ao_loc[jsh];
+                    int k0 = envs.ao_loc[ksh] - nao;
+                    double *dm_local = component_dm[component] + j0*(size_t)nao_local + i0;
+                    double *auxvec = component_auxvec[component];
+#pragma unroll
+                    for (int n = 0; n < GOUT_WIDTH; ++n) {
+                        uint32_t ijk = n*gout_stride+gout_id;
+                        if (ijk >= nf) break;
+                        float div_nfi = c_div_nf[li];
+                        float div_nfj = c_div_nf[lj];
+                        uint32_t jk = ijk * div_nfi;
+                        uint32_t i = ijk - jk * nfi;
+                        uint32_t k = jk * div_nfj;
+                        uint32_t j = jk - k * nfj;
+                        dm_tensor[n] = dm_local[j*nao_local+i] * auxvec[k0+k];
+                    }
+                } else if (density_auxvec == NULL) {
                     int nfi = c_nf[li];
                     int nfj = c_nf[lj];
                     float div_nfi = c_div_nf[li];
@@ -741,16 +770,44 @@ int sum_ejk_int3c2e_ip1(double *ejk, double *ejk_aux,
                     int *ao_pair_loc, int aux_offset,
                     int nao, int npairs, int naux, int natm)
 {
-    cudaFuncSetAttribute(sum_ejk_int3c2e_ip1_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, shm_size);
+    cudaFuncSetAttribute(sum_ejk_int3c2e_ip1_kernel<false>, cudaFuncAttributeMaxDynamicSharedMemorySize, shm_size);
     dim3 blocks(nbatches_shl_pair, nbatches_ksh);
-    sum_ejk_int3c2e_ip1_kernel<<<blocks, THREADS, shm_size>>>(
+    sum_ejk_int3c2e_ip1_kernel<false><<<blocks, THREADS, shm_size>>>(
             ejk, ejk_aux, dm, density_auxvec, n_dm, *envs,
             omega, lr_factor, sr_factor,
             shl_pair_offsets, bas_ij_idx, ksh_offsets, gout_stride_lookup,
-            ao_pair_loc, aux_offset, naux);
+            ao_pair_loc, aux_offset, naux, NULL, NULL, NULL, NULL, NULL);
     cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) {
         fprintf(stderr, "CUDA Error in ejk_int3c2e_ip1: %s\n", cudaGetErrorString(err));
+        return 1;
+    }
+    return 0;
+}
+
+// Contract component-local DM and auxiliary-vector inputs in one J traversal.
+int sum_j_int3c2e_ip1_multi_in(double *ej, double *ej_aux,
+                               double **dm, double **auxvec,
+                               RysIntEnvVars *envs, int shm_size,
+                               int nbatches_shl_pair, int nbatches_ksh,
+                               int *shl_pair_offsets, uint32_t *bas_ij_idx,
+                               int *ksh_offsets, int *gout_stride_lookup,
+                               int *pair_component, int *local_ao_loc,
+                               int *component_nao, int natm)
+{
+    cudaFuncSetAttribute(sum_ejk_int3c2e_ip1_kernel<true>,
+            cudaFuncAttributeMaxDynamicSharedMemorySize, shm_size);
+    dim3 blocks(nbatches_shl_pair, nbatches_ksh);
+    sum_ejk_int3c2e_ip1_kernel<true><<<blocks, THREADS, shm_size>>>(
+            ej, ej_aux, NULL, NULL, 1, *envs,
+            0., 1., 1., // Intercomponent J uses the full Coulomb operator.
+            shl_pair_offsets, bas_ij_idx, ksh_offsets, gout_stride_lookup,
+            NULL, 0, 0, dm, auxvec, pair_component, local_ao_loc,
+            component_nao);
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        fprintf(stderr, "CUDA Error in ejk_int3c2e_ip1: %s\n",
+                cudaGetErrorString(err));
         return 1;
     }
     return 0;

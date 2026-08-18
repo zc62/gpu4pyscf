@@ -20,6 +20,7 @@
 DIIS
 """
 
+import math
 import cupy as cp
 import scipy.linalg
 import scipy.optimize
@@ -48,6 +49,30 @@ class CDIIS(lib.diis.DIIS):
         self.space = 8
 
     def update(self, s, d, f, *args, **kwargs):
+        if isinstance(f, dict):
+            keys = sorted(f.keys())
+            f_shape = {k: f[k].shape for k in keys}
+            errvec = []
+            corth = {} if self.Corth is None else self.Corth
+            for k in keys:
+                corth_k = corth.get(k)
+                self.Corth = corth_k
+                errvec.append(self._sdf_err_vec(s[k], d[k], f[k]).ravel())
+                corth[k] = self.Corth
+            self.Corth = corth
+            errvec = cp.concatenate(errvec)
+            f_flat = cp.concatenate([f[k].ravel() for k in keys])
+            xnew = lib.diis.DIIS.update(self, f_flat, xerr=errvec)
+            if self.rollback > 0 and len(self._bookkeep) == self.space:
+                self._bookkeep = self._bookkeep[-self.rollback:]
+            offset = 0
+            out = {}
+            for k in keys:
+                size = math.prod(f_shape[k])
+                out[k] = xnew[offset:offset+size].reshape(f_shape[k])
+                offset += size
+            return out
+
         if d.dtype == cp.complex128:
             s = s.astype(cp.complex128)
         errvec = self._sdf_err_vec(s, d, f)
@@ -77,6 +102,17 @@ class CDIIS(lib.diis.DIIS):
 
     def _sdf_err_vec(self, s, d, f):
         '''error vector = SDF - FDS'''
+        if isinstance(f, dict):
+            keys = sorted(f.keys())
+            errvec = []
+            corth = {} if self.Corth is None else self.Corth
+            for k in keys:
+                self.Corth = corth.get(k)
+                errvec.append(self._sdf_err_vec(s[k], d[k], f[k]).ravel())
+                corth[k] = self.Corth
+            self.Corth = corth
+            return cp.concatenate(errvec)
+
         if f.ndim == s.ndim+1: # UHF
             assert len(f) == 2
             if s.ndim == 2: # molecular SCF or single k-point

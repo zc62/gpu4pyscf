@@ -17,14 +17,18 @@
     int ksh0, int ksh1, int iprim, int jprim, int kprim, \
     uint32_t *bas_ij_idx, int *ao_pair_loc, \
     int aux_offset, int naux, int nao, \
-    int thread_id, double *shared_memory
+    int thread_id, double *shared_memory, \
+    double **component_dm, double **component_auxvec, \
+    int *pair_component, int *local_ao_loc, int *component_nao
 
 #define LAUNCH_KERNEL(KERNEL) \
-    KERNEL(ejk, ejk_aux, dm, density_auxvec, omega, lr_factor, sr_factor, envs, \
+    KERNEL<componentwise>(ejk, ejk_aux, dm, density_auxvec, omega, lr_factor, sr_factor, envs, \
     shl_pair0, shl_pair1, ksh0, ksh1, iprim, jprim, kprim, \
-    bas_ij_idx, ao_pair_loc, aux_offset, naux, nao, thread_id, shared_memory)
+    bas_ij_idx, ao_pair_loc, aux_offset, naux, nao, thread_id, shared_memory, component_dm, \
+    component_auxvec, pair_component, local_ao_loc, component_nao)
 
 
+template <bool componentwise>
 __device__ inline
 void int3c2e_ip1_000(KERNEL_ARGS)
 {
@@ -77,7 +81,25 @@ void int3c2e_ip1_000(KERNEL_ARGS)
             }
             double dm_tensor[1];
             if (pair_ij < shl_pair1 && kidx < ksh1) {
-                if (density_auxvec == NULL) {
+                if (componentwise) {
+                    int component = pair_component[pair_ij];
+                    int nao_local = component_nao[component];
+                    int i0 = local_ao_loc[ish];
+                    int j0 = local_ao_loc[jsh];
+                    int k0 = envs.ao_loc[ksh] - nao;
+                    double *dm_local = component_dm[component] + j0 * nao_local + i0;
+                    double *density_auxvec_local = component_auxvec[component];
+#pragma unroll
+                    for (int n = 0, k = 0; k < 1; k++) {
+#pragma unroll
+                        for (int j = 0; j < 1; j++) {
+#pragma unroll
+                            for (int i = 0; i < 1; i++, n++) {
+                                dm_tensor[n] = dm_local[j*nao_local+i] * density_auxvec_local[k0+k];
+                            }
+                        }
+                    }
+                } else if (density_auxvec == NULL) {
                     int k0 = envs.ao_loc[ksh0] - nao - aux_offset + ksh - ksh0;
                     size_t pair_offset = ao_pair_loc[pair_ij];
                     double *dm_local = dm + pair_offset * naux + k0;
@@ -236,6 +258,7 @@ void int3c2e_ip1_000(KERNEL_ARGS)
     }
 }
 
+template <bool componentwise>
 __device__ inline
 void int3c2e_ip1_100(KERNEL_ARGS)
 {
@@ -288,7 +311,25 @@ void int3c2e_ip1_100(KERNEL_ARGS)
             }
             double dm_tensor[3];
             if (pair_ij < shl_pair1 && kidx < ksh1) {
-                if (density_auxvec == NULL) {
+                if (componentwise) {
+                    int component = pair_component[pair_ij];
+                    int nao_local = component_nao[component];
+                    int i0 = local_ao_loc[ish];
+                    int j0 = local_ao_loc[jsh];
+                    int k0 = envs.ao_loc[ksh] - nao;
+                    double *dm_local = component_dm[component] + j0 * nao_local + i0;
+                    double *density_auxvec_local = component_auxvec[component];
+#pragma unroll
+                    for (int n = 0, k = 0; k < 1; k++) {
+#pragma unroll
+                        for (int j = 0; j < 1; j++) {
+#pragma unroll
+                            for (int i = 0; i < 3; i++, n++) {
+                                dm_tensor[n] = dm_local[j*nao_local+i] * density_auxvec_local[k0+k];
+                            }
+                        }
+                    }
+                } else if (density_auxvec == NULL) {
                     int k0 = envs.ao_loc[ksh0] - nao - aux_offset + ksh - ksh0;
                     size_t pair_offset = ao_pair_loc[pair_ij];
                     double *dm_local = dm + pair_offset * naux + k0;
@@ -509,6 +550,7 @@ void int3c2e_ip1_100(KERNEL_ARGS)
     }
 }
 
+template <bool componentwise>
 __device__ inline
 void int3c2e_ip1_110(KERNEL_ARGS)
 {
@@ -561,7 +603,25 @@ void int3c2e_ip1_110(KERNEL_ARGS)
             }
             double dm_tensor[9];
             if (pair_ij < shl_pair1 && kidx < ksh1) {
-                if (density_auxvec == NULL) {
+                if (componentwise) {
+                    int component = pair_component[pair_ij];
+                    int nao_local = component_nao[component];
+                    int i0 = local_ao_loc[ish];
+                    int j0 = local_ao_loc[jsh];
+                    int k0 = envs.ao_loc[ksh] - nao;
+                    double *dm_local = component_dm[component] + j0 * nao_local + i0;
+                    double *density_auxvec_local = component_auxvec[component];
+#pragma unroll
+                    for (int n = 0, k = 0; k < 1; k++) {
+#pragma unroll
+                        for (int j = 0; j < 3; j++) {
+#pragma unroll
+                            for (int i = 0; i < 3; i++, n++) {
+                                dm_tensor[n] = dm_local[j*nao_local+i] * density_auxvec_local[k0+k];
+                            }
+                        }
+                    }
+                } else if (density_auxvec == NULL) {
                     int k0 = envs.ao_loc[ksh0] - nao - aux_offset + ksh - ksh0;
                     size_t pair_offset = ao_pair_loc[pair_ij];
                     double *dm_local = dm + pair_offset * naux + k0;
@@ -962,6 +1022,7 @@ void int3c2e_ip1_110(KERNEL_ARGS)
     }
 }
 
+template <bool componentwise>
 __device__ inline
 void int3c2e_ip1_200(KERNEL_ARGS)
 {
@@ -1014,7 +1075,25 @@ void int3c2e_ip1_200(KERNEL_ARGS)
             }
             double dm_tensor[6];
             if (pair_ij < shl_pair1 && kidx < ksh1) {
-                if (density_auxvec == NULL) {
+                if (componentwise) {
+                    int component = pair_component[pair_ij];
+                    int nao_local = component_nao[component];
+                    int i0 = local_ao_loc[ish];
+                    int j0 = local_ao_loc[jsh];
+                    int k0 = envs.ao_loc[ksh] - nao;
+                    double *dm_local = component_dm[component] + j0 * nao_local + i0;
+                    double *density_auxvec_local = component_auxvec[component];
+#pragma unroll
+                    for (int n = 0, k = 0; k < 1; k++) {
+#pragma unroll
+                        for (int j = 0; j < 1; j++) {
+#pragma unroll
+                            for (int i = 0; i < 6; i++, n++) {
+                                dm_tensor[n] = dm_local[j*nao_local+i] * density_auxvec_local[k0+k];
+                            }
+                        }
+                    }
+                } else if (density_auxvec == NULL) {
                     int k0 = envs.ao_loc[ksh0] - nao - aux_offset + ksh - ksh0;
                     size_t pair_offset = ao_pair_loc[pair_ij];
                     double *dm_local = dm + pair_offset * naux + k0;
@@ -1322,6 +1401,7 @@ void int3c2e_ip1_200(KERNEL_ARGS)
     }
 }
 
+template <bool componentwise>
 __device__ inline
 void int3c2e_ip1_001(KERNEL_ARGS)
 {
@@ -1374,7 +1454,25 @@ void int3c2e_ip1_001(KERNEL_ARGS)
             }
             double dm_tensor[3];
             if (pair_ij < shl_pair1 && kidx < ksh1) {
-                if (density_auxvec == NULL) {
+                if (componentwise) {
+                    int component = pair_component[pair_ij];
+                    int nao_local = component_nao[component];
+                    int i0 = local_ao_loc[ish];
+                    int j0 = local_ao_loc[jsh];
+                    int k0 = envs.ao_loc[ksh] - nao;
+                    double *dm_local = component_dm[component] + j0 * nao_local + i0;
+                    double *density_auxvec_local = component_auxvec[component];
+#pragma unroll
+                    for (int n = 0, k = 0; k < 3; k++) {
+#pragma unroll
+                        for (int j = 0; j < 1; j++) {
+#pragma unroll
+                            for (int i = 0; i < 1; i++, n++) {
+                                dm_tensor[n] = dm_local[j*nao_local+i] * density_auxvec_local[k0+k];
+                            }
+                        }
+                    }
+                } else if (density_auxvec == NULL) {
                     int k0 = envs.ao_loc[ksh0] - nao - aux_offset + ksh - ksh0;
                     size_t pair_offset = ao_pair_loc[pair_ij];
                     double *dm_local = dm + pair_offset * naux + k0;
@@ -1595,6 +1693,7 @@ void int3c2e_ip1_001(KERNEL_ARGS)
     }
 }
 
+template <bool componentwise>
 __device__ inline
 void int3c2e_ip1_101(KERNEL_ARGS)
 {
@@ -1647,7 +1746,25 @@ void int3c2e_ip1_101(KERNEL_ARGS)
             }
             double dm_tensor[9];
             if (pair_ij < shl_pair1 && kidx < ksh1) {
-                if (density_auxvec == NULL) {
+                if (componentwise) {
+                    int component = pair_component[pair_ij];
+                    int nao_local = component_nao[component];
+                    int i0 = local_ao_loc[ish];
+                    int j0 = local_ao_loc[jsh];
+                    int k0 = envs.ao_loc[ksh] - nao;
+                    double *dm_local = component_dm[component] + j0 * nao_local + i0;
+                    double *density_auxvec_local = component_auxvec[component];
+#pragma unroll
+                    for (int n = 0, k = 0; k < 3; k++) {
+#pragma unroll
+                        for (int j = 0; j < 1; j++) {
+#pragma unroll
+                            for (int i = 0; i < 3; i++, n++) {
+                                dm_tensor[n] = dm_local[j*nao_local+i] * density_auxvec_local[k0+k];
+                            }
+                        }
+                    }
+                } else if (density_auxvec == NULL) {
                     int k0 = envs.ao_loc[ksh0] - nao - aux_offset + ksh - ksh0;
                     size_t pair_offset = ao_pair_loc[pair_ij];
                     double *dm_local = dm + pair_offset * naux + k0;
@@ -2043,6 +2160,7 @@ void int3c2e_ip1_101(KERNEL_ARGS)
     }
 }
 
+template <bool componentwise>
 __device__ inline
 void int3c2e_ip1_002(KERNEL_ARGS)
 {
@@ -2095,7 +2213,25 @@ void int3c2e_ip1_002(KERNEL_ARGS)
             }
             double dm_tensor[6];
             if (pair_ij < shl_pair1 && kidx < ksh1) {
-                if (density_auxvec == NULL) {
+                if (componentwise) {
+                    int component = pair_component[pair_ij];
+                    int nao_local = component_nao[component];
+                    int i0 = local_ao_loc[ish];
+                    int j0 = local_ao_loc[jsh];
+                    int k0 = envs.ao_loc[ksh] - nao;
+                    double *dm_local = component_dm[component] + j0 * nao_local + i0;
+                    double *density_auxvec_local = component_auxvec[component];
+#pragma unroll
+                    for (int n = 0, k = 0; k < 6; k++) {
+#pragma unroll
+                        for (int j = 0; j < 1; j++) {
+#pragma unroll
+                            for (int i = 0; i < 1; i++, n++) {
+                                dm_tensor[n] = dm_local[j*nao_local+i] * density_auxvec_local[k0+k];
+                            }
+                        }
+                    }
+                } else if (density_auxvec == NULL) {
                     int k0 = envs.ao_loc[ksh0] - nao - aux_offset + ksh - ksh0;
                     size_t pair_offset = ao_pair_loc[pair_ij];
                     double *dm_local = dm + pair_offset * naux + k0;
@@ -2403,13 +2539,17 @@ void int3c2e_ip1_002(KERNEL_ARGS)
     }
 }
 
+template <bool componentwise>
 __device__ inline
 int int3c2e_ip1_unrolled(double *ejk, double *ejk_aux, double *dm, double *density_auxvec,
                     double omega, double lr_factor, double sr_factor,
                     RysIntEnvVars& envs, int shl_pair0, int shl_pair1, int ksh0, int ksh1,
                     int iprim, int jprim, int kprim, int li, int lj, int lk,
                     uint32_t *bas_ij_idx, int *ao_pair_loc,
-                    int aux_offset, int naux, int nao, int thread_id, double *shared_memory)
+                    int aux_offset, int naux, int nao, int thread_id,
+                    double *shared_memory, double **component_dm,
+                    double **component_auxvec, int *pair_component,
+                    int *local_ao_loc, int *component_nao)
 {
     int kij_type = lk*25 + li*5 + lj;
     switch (kij_type) {
