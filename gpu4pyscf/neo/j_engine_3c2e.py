@@ -6,16 +6,43 @@ from pyscf.gto.mole import ANG_OF, PTR_EXP, conc_env
 
 from gpu4pyscf.df import j_engine_3c2e as df_j_engine_3c2e
 from gpu4pyscf.df.int3c2e_bdiv import _conc_locs, LMAX, L_AUX_MAX, THREADS
-from gpu4pyscf.gto.mole import SortedGTO, PTR_BAS_COORD, RysIntEnvVars
+from gpu4pyscf.gto.mole import (
+    SortedGTO, PTR_BAS_COORD, RysIntEnvVars)
 from gpu4pyscf.lib import logger
 from gpu4pyscf.lib.cupy_helper import asarray, transpose_sum
+from gpu4pyscf.neo import int3c2e_bdiv
 from gpu4pyscf.scf.j_engine import libvhf_md
-from gpu4pyscf.scf.jk import _nearest_power2, _scale_sp_ctr_coeff, SHM_SIZE
+from gpu4pyscf.scf.jk import (
+    _nearest_power2, _scale_sp_ctr_coeff, SHM_SIZE)
 
 libvhf_md.dm_to_Rt_multi_in.restype = ctypes.c_int
 libvhf_md.contract_int3c2e_dm_multi_out.restype = ctypes.c_int
 libvhf_md.contract_int3c2e_auxvec_multi_in.restype = ctypes.c_int
 libvhf_md.Rt_to_dm_multi_out.restype = ctypes.c_int
+
+
+def _cache_q_cond_and_non0pairs(mol, rys_envs, precision,
+                                shell_component):
+    # Copied from scf.j_engine._cache_q_cond_and_non0pairs.
+    assert all(mol.uniq_l_ctr[:,1] == 1)
+    bas_pair_cache = int3c2e_bdiv._cache_q_cond_and_non0pairs(
+        mol, rys_envs, precision, shell_component, tile=1)
+    uniq_l = mol.uniq_l_ctr[:,0]
+    lmax = min(uniq_l.max(), LMAX)
+    # The pairs for MD-J must include all pairs between angular moments.
+    # bas_pair_cache are l_ctr-indexed. The missing (li,lj) entries are filled
+    # zero-length orbital-pairs.
+    padding = (cp.zeros(0, dtype=np.uint32), cp.zeros(0, dtype=np.float32))
+    out = {(li, lj): padding for li in range(lmax+1) for lj in range(li+1)}
+    for i, j in bas_pair_cache:
+        li = uniq_l[i]
+        lj = uniq_l[j]
+        pair_ij, q_cond, s_cond = bas_pair_cache[i, j]
+        idx = cp.argsort(q_cond)[::-1]
+        out[li, lj] = pair_ij[idx], q_cond[idx]
+    # End copied block.
+    return out
+
 
 class Int3c2eOpt:
     def __init__(self, components, auxmol):
@@ -37,7 +64,8 @@ class Int3c2eOpt:
         # One sorted molecule provides a shared angular shell-pair schedule.
         # Cross-component AO pairs are removed because each density matrix is
         # defined in one distinguishable component space.
-        self.mol = mol = SortedGTO.from_mol(mol, decontract=True, diffuse_cutoff=1e200)
+        mol = self.mol = SortedGTO.from_mol(
+            mol, decontract=True, diffuse_cutoff=1e200)
         # very high angular momentum basis are processed on CPU
         lmax = mol.uniq_l_ctr[:,0].max()
         assert lmax <= LMAX
@@ -73,12 +101,15 @@ class Int3c2eOpt:
         _env = cp.array(_scale_sp_ctr_coeff(mol))
         ao_loc = cp.array(mol.ao_loc)
         rys_envs = RysIntEnvVars.new(mol.natm, mol.nbas, _atm, _bas, _env, ao_loc)
-        self.bas_pair_cache = bas_pair_cache = df_j_engine_3c2e._cache_q_cond_and_non0pairs(
-            mol, rys_envs, cutoff)
+        # Apply component locality inside the original overlap and q-condition
+        # screening rather than filtering a combined square pair list later.
+        self.bas_pair_cache = bas_pair_cache = \
+                _cache_q_cond_and_non0pairs(mol, rys_envs, cutoff, shell_component)
         log.timer('Initialize q_cond', *cput0)
 
         auxmol = self.auxmol = SortedGTO.from_mol(
             self.auxmol, decontract=True, diffuse_cutoff=1e200)
+
         _atm_cpu, _bas_cpu, _env_cpu = conc_env(
             mol._atm, mol._bas, _scale_sp_ctr_coeff(mol),
             auxmol._atm, auxmol._bas, _scale_sp_ctr_coeff(auxmol))
@@ -98,35 +129,35 @@ class Int3c2eOpt:
             mol.natm, mol.nbas, _atm, _bas, _env, ao_loc)
 
         # Keep only same-component shell pairs and group them by angular block.
-        pair_lst = []
-        # pair_component[p] owns shell-pair job p in pair_lst.
+        shl_pair_idx = []
+        # pair_component[p] identifies the component of shell pair p.
         pair_component = []
-        # shl_pair_offsets delimit angular blocks in pair_lst.
+        # Preserve the original angular-block offsets after grouping by component.
         shl_pair_offsets = [0]
         p1 = 0
         nbas = mol.nbas
-        for key in sorted(bas_pair_cache):
-            pair = bas_pair_cache[key][0].get()
-            if pair.size == 0:
-                continue
+        pair_keys = [key for key in sorted(bas_pair_cache)
+                     if bas_pair_cache[key][0].size]
+        pair_sizes = [bas_pair_cache[key][0].size for key in pair_keys]
+        pairs = cp.hstack([bas_pair_cache[key][0] for key in pair_keys]).get()
+        pairs = np.split(pairs, np.cumsum(pair_sizes[:-1]))
+        # Component grouping needs host indices; transfer all angular blocks
+        # together instead of synchronizing once for each block.
+        for key, pair in zip(pair_keys, pairs):
             ish = pair // nbas
-            jsh = pair % nbas
-            same_component = shell_component[ish] == shell_component[jsh]
-            if not np.any(same_component):
-                continue
-            pair = pair[same_component]
-            ish = ish[same_component]
+            # pair_mask already removed cross-component pairs before overlap
+            # and q-condition construction.
             component = shell_component[ish]
             for ic in range(len(component_names)):
                 pair_t = pair[component == ic]
                 if pair_t.size == 0:
                     continue
-                pair_lst.append(pair_t)
+                shl_pair_idx.append(pair_t)
                 pair_component.append(np.full(pair_t.size, ic, dtype=np.int32))
                 p1 += pair_t.size
             shl_pair_offsets.append(p1)
-        pair_lst = np.hstack(pair_lst).astype(np.uint32)
-        self.shl_pair_idx = pair_lst
+        shl_pair_idx = np.hstack(shl_pair_idx).astype(np.uint32)
+        self.shl_pair_idx = shl_pair_idx
         self.pair_component = np.hstack(pair_component).astype(np.int32)
 
         # local_ao_loc[ish] is shell ish's AO offset in its component matrix.
@@ -141,7 +172,7 @@ class Int3c2eOpt:
 
         ls = np.asarray(mol._bas[:,ANG_OF], dtype=np.int32)
         ll = ls[:,None] + ls
-        ll = ll.ravel()[pair_lst]
+        ll = ll.ravel()[shl_pair_idx]
         xyz_size = (ll+1)*(ll+2)*(ll+3)//6
         self.pair_loc = np.cumsum(np.append(np.int32(0), xyz_size.ravel()), dtype=np.int32)
 

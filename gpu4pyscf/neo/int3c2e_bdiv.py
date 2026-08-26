@@ -3,23 +3,168 @@ NEO 3-center 2-electron Coulomb integral helper functions
 '''
 
 import ctypes
+import math
 import numpy as np
 import cupy as cp
 from pyscf import gto
-from pyscf.gto.mole import ANG_OF, ATOM_OF
+from pyscf.gto.mole import ANG_OF, ATOM_OF, PTR_EXP, conc_env
 from gpu4pyscf.df import int3c2e_bdiv
-from gpu4pyscf.gto.mole import SortedMole
+from gpu4pyscf.gto.mole import (
+    PTR_BAS_COORD, SortedMole, RysIntEnvVars, extract_pgto_params)
 from gpu4pyscf.lib import logger
 from gpu4pyscf.lib.cupy_helper import asarray, ndarray, transpose_sum
 from gpu4pyscf.lib.utils import splits_by_blocksize
 from gpu4pyscf.scf.jk import (
-    _check_rsh_factors, libvhf_rys)
+    _nearest_power2, _scale_sp_ctr_coeff, _check_rsh_factors,
+    Q_COND_MARGIN, libvhf_rys)
 from gpu4pyscf.df.int3c2e_bdiv import (
-    int3c2e_scheme, _split_l_ctr_pattern, argsort_aux)
+    int3c2e_scheme, _split_l_ctr_pattern, argsort_aux, _conc_locs)
 from gpu4pyscf.__config__ import props as gpu_specs
+from gpu4pyscf.neo import int1e
 
 THREADS = int3c2e_bdiv.THREADS
 POOL_SIZE = int3c2e_bdiv.POOL_SIZE
+LMAX = int3c2e_bdiv.LMAX
+
+
+def _cache_q_cond_and_non0pairs(mol, rys_envs, precision,
+                                shell_component, tile=1, tril=True):
+    # Copied from scf.jk._cache_q_cond_and_non0pairs.
+    # NEO: shell_component identifies the owner of each sorted shell.
+    from gpu4pyscf.pbc.scf.rsjk import libpbc, _group_by_split_points
+    omega = mol.omega
+    ls = np.arange(LMAX+1)
+    li = ls[:,None]
+    lj = ls
+    lij = li + lj
+    nfi = (li + 1) * (li + 2) // 2
+    nfj = (lj + 1) * (lj + 2) // 2
+    nroots = lij + 1
+    if omega < 0:
+        nroots *= 2
+
+    SIZEOF_FLOAT = ctypes.sizeof(ctypes.c_float)
+    gout_width = 29
+    unit = (li+1)*(lj+1)*2 + (li+1)*(lj+1)*(lij+1) + 6 + nroots*2
+    shm_size = 1024 * 48 - 1024
+    nsp_max = _nearest_power2(shm_size // (unit*SIZEOF_FLOAT))
+    gout_size = nfi * nfj
+    gout_stride = (gout_size+gout_width-1) // gout_width
+    gout_stride = _nearest_power2(gout_stride, return_leq=False)
+    nsp_per_block = THREADS // gout_stride
+    # min(nsp_per_block, nsp_max)
+    nsp_per_block = np.where(nsp_per_block < nsp_max, nsp_per_block, nsp_max)
+    gout_stride = THREADS // nsp_per_block
+    gout_stride = cp.asarray(gout_stride, dtype=np.int32)
+    shm_size = nsp_per_block * (unit*SIZEOF_FLOAT)
+    # (pp|pp) requires more shm than this estimation. 5888 is the required size
+    max_shm_size = max(shm_size.max(), 5888*SIZEOF_FLOAT)
+
+    pair_ij_kern = libpbc.PBCsort_pair_ij
+    pair_ij_kern.restype = ctypes.c_int
+
+    l_ctr_offsets = np.append(0, np.cumsum(mol.l_ctr_counts))
+    n = mol.l_ctr_counts.max()
+    pair_buf = cp.empty(n**2, dtype=np.int64)
+    # NEO: evaluate the overlap bound only for component-local shell pairs.
+    ovlp_mask = int1e._shell_overlap_mask(
+        mol, shell_component, precision=precision**2)
+    if tril:
+        ovlp_mask = cp.tril(ovlp_mask)
+    ovlp_mask = ovlp_mask.ravel()
+    nbas = mol.nbas
+    uniq_l = mol.uniq_l_ctr[:,0]
+    n_groups = np.count_nonzero(uniq_l <= LMAX)
+    if tril:
+        pair_keys = ((i, j) for i in range(n_groups) for j in range(i+1))
+    else:
+        pair_keys = ((i, j) for i in range(n_groups) for j in range(n_groups))
+    bas_ij_cache = {} # The effective shell pair = ish*nbas+jsh
+    shl_pair_offsets = [] # the bas_ij_idx offset for each blockIdx.x
+    sp0 = sp1 = 0
+    for i, j in pair_keys:
+        li = uniq_l[i]
+        lj = uniq_l[j]
+        ish0, ish1 = l_ctr_offsets[i], l_ctr_offsets[i+1]
+        jsh0, jsh1 = l_ctr_offsets[j], l_ctr_offsets[j+1]
+        ish = cp.arange(ish0, ish1, dtype=np.uint32)
+        jsh = cp.arange(jsh0, jsh1, dtype=np.uint32)
+        nish = len(ish)
+        njsh = len(jsh)
+        pair_ij = ndarray(nish*njsh, dtype=np.int64, buffer=pair_buf)
+        err = pair_ij_kern(
+            ctypes.cast(pair_ij.data.ptr, ctypes.c_void_p),
+            ctypes.cast(ish.data.ptr, ctypes.c_void_p),
+            ctypes.cast(jsh.data.ptr, ctypes.c_void_p),
+            ctypes.c_int(nish), ctypes.c_int(njsh),
+            ctypes.c_int(nbas), ctypes.c_int(tile))
+        pair_ij = pair_ij[ovlp_mask[pair_ij]]
+        bas_ij_cache[i,j] = cp.asarray(pair_ij, dtype=np.uint32)
+        nshl_pair = len(pair_ij)
+        sp0, sp1 = sp1, sp1 + nshl_pair
+        nsp_per_block = THREADS // gout_stride[li, lj] * 8
+        shl_pair_offsets.append(np.arange(sp0, sp1, nsp_per_block, dtype=np.int32))
+    ovlp_mask = None
+    shl_pair_offsets.append(np.int32(sp1))
+    shl_pair_offsets = cp.array(np.hstack(shl_pair_offsets), dtype=np.int32)
+    bas_ij_counts = [len(x) for x in bas_ij_cache.values()]
+    bas_ij_cum = np.cumsum(bas_ij_counts)
+    bas_ij_idx = cp.array(cp.hstack(bas_ij_cache.values()), dtype=np.uint32)
+
+    lr_factor = sr_factor = 1
+    if omega < 0:
+        lr_factor = 0
+    if omega > 0:
+        sr_factor = 0
+    nbatches_shl_pair = len(shl_pair_offsets) - 1
+    q_out = cp.empty(len(bas_ij_idx), dtype=np.float32)
+    libvhf_rys.int2e_qcond_estimator.restype = ctypes.c_int
+    err = libvhf_rys.int2e_qcond_estimator(
+        ctypes.cast(q_out.data.ptr, ctypes.c_void_p),
+        ctypes.byref(rys_envs),
+        ctypes.c_int(max_shm_size),
+        ctypes.c_int(nbatches_shl_pair),
+        ctypes.cast(bas_ij_idx.data.ptr, ctypes.c_void_p),
+        ctypes.cast(shl_pair_offsets.data.ptr, ctypes.c_void_p),
+        ctypes.cast(gout_stride.data.ptr, ctypes.c_void_p),
+        ctypes.c_double(omega),
+        ctypes.c_double(lr_factor),
+        ctypes.c_double(sr_factor))
+    if err != 0:
+        raise RuntimeError('int2e_qcond_estimator kernel failed')
+
+    if omega < 0:
+        diffuse_exps, diffuse_ctr_coef = extract_pgto_params(mol, 'diffuse')
+        diffuse_exps = cp.asarray(diffuse_exps, dtype=np.float32)
+        diffuse_ctr_coef = cp.asarray(diffuse_ctr_coef, dtype=np.float32)
+        s_out = cp.empty(len(bas_ij_idx), dtype=np.float32)
+        libvhf_rys.fill_s_estimator.restype = ctypes.c_int
+        err = libvhf_rys.fill_s_estimator(
+            ctypes.cast(s_out.data.ptr, ctypes.c_void_p),
+            ctypes.byref(rys_envs),
+            ctypes.cast(bas_ij_idx.data.ptr, ctypes.c_void_p),
+            ctypes.cast(diffuse_exps.data.ptr, ctypes.c_void_p),
+            ctypes.cast(diffuse_ctr_coef.data.ptr, ctypes.c_void_p),
+            ctypes.c_int(len(bas_ij_idx)),
+            ctypes.c_double(omega))
+        if err != 0:
+            raise RuntimeError('fill_s_estimator kernel failed')
+
+    split_points = cp.arange(math.log(precision), 2., Q_COND_MARGIN)
+    q_cond_cache = {}
+    q_cond = cp.split(q_out, bas_ij_cum[:-1])
+    if omega < 0:
+        s_cond = cp.split(s_out, bas_ij_cum[:-1])
+    for i, key in enumerate(bas_ij_cache):
+        idx = _group_by_split_points(q_cond[i], split_points)
+        pair_ij = bas_ij_cache[key][idx]
+        q_cond_ij = q_cond[i][idx]
+        s_cond_ij = q_cond_ij
+        if omega < 0:
+            s_cond_ij = s_cond[i][idx]
+        q_cond_cache[key] = pair_ij, q_cond_ij, s_cond_ij
+    # End copied block.
+    return q_cond_cache
 
 
 def _aggregate_shl_pair_blocks(mol, bas_ij_blocks, nsp_per_block=512):
@@ -126,35 +271,65 @@ class Int3c2eOpt(int3c2e_bdiv.Int3c2eOpt):
         self.block_components = None
 
     def build(self, cutoff=1e-14, tril=True):
-        super().build(cutoff=cutoff, tril=tril)
-        mol = self.mol
-        component_names = self.component_names
+        # Copied from df.int3c2e_bdiv.Int3c2eOpt.build.
+        mol = self.mol = SortedMole.from_cell(self.mol)
+        auxmol = self.auxmol = SortedMole.from_cell(self.auxmol)
+        _atm, _bas, _env = conc_env(
+            mol._atm, mol._bas, _scale_sp_ctr_coeff(mol),
+            auxmol._atm, auxmol._bas, _scale_sp_ctr_coeff(auxmol))
+        #NOTE: PTR_BAS_COORD is not updated in conc_env()
+        off = _bas[mol.nbas,PTR_EXP] - auxmol._bas[0,PTR_EXP]
+        _bas[mol.nbas:,PTR_BAS_COORD] += off
+        ao_loc = mol.ao_loc
+        aux_loc = auxmol.ao_loc
+        ao_loc = cp.asarray(_conc_locs(ao_loc, aux_loc), dtype=np.int32)
+        self._int3c2e_envs = RysIntEnvVars.new(
+            mol.natm, mol.nbas, _atm, _bas, _env, ao_loc)
+
+        # NEO: remove cross-component shell pairs before overlap and
+        # q-condition screening constructs the AO-pair work list.
         shell_component = self.atom_component[mol._bas[:,ATOM_OF]]
+        bas_pair_cache = _cache_q_cond_and_non0pairs(
+            mol, self._int3c2e_envs, cutoff, shell_component,
+            tile=4, tril=tril)
+        self.bas_ij_cache = {
+            k: cp.sort(v[0]) for k, v in mol.iter_pair_by_l(bas_pair_cache)}
+        # End copied block.
 
-        shell_component_gpu = cp.asarray(shell_component)
+        component_names = self.component_names
+
         nbas = mol.nbas
-        bas_ij_cache = {}
-        # shell_component[ish] identifies the component containing sorted
-        # shell ish. Filter the original angular caches to same-component
-        # shell pairs because every DM is component-local.
+        l_ctr_offsets = np.append(0, np.cumsum(mol.l_ctr_counts))
+        component_ids = np.arange(len(component_names) + 1)
+        component_blocks = [[] for _ in component_names]
+        pair_blocks = []
+        block_offsets = []
         for k, pair_ij in self.bas_ij_cache.items():
-            same_component = shell_component_gpu[pair_ij//nbas] == \
-                    shell_component_gpu[pair_ij%nbas]
-            bas_ij_cache[k] = cp.sort(pair_ij[same_component])
+            if pair_ij.size == 0:
+                continue
+            # SortedMole keeps component shells contiguous within each angular
+            # group, so the parent's encoded-pair order groups components.
+            pair_blocks.append((k, pair_ij))
+            i = k[0]
+            ish0, ish1 = l_ctr_offsets[i:i+2]
+            shell_starts = ish0 + np.searchsorted(
+                shell_component[ish0:ish1], component_ids)
+            pair_starts = cp.asarray(shell_starts*nbas, dtype=pair_ij.dtype)
+            block_offsets.append(cp.searchsorted(pair_ij, pair_starts))
+        block_offsets = cp.stack(block_offsets).get()
+        for (k, pair_ij), offsets in zip(pair_blocks, block_offsets):
+            for ic, (p0, p1) in enumerate(zip(offsets[:-1], offsets[1:])):
+                if p0 != p1:
+                    component_blocks[ic].append(
+                        (k, pair_ij[p0:p1]))
 
-        # Split each angular cache by component and append components in
-        # component_names order. Thus all AO-pair rows for one component are
-        # contiguous even when several components share the same angular key.
+        # Append angular blocks in component order so each component occupies
+        # one contiguous range of grouped integral rows and CDERI columns.
         bas_ij_blocks = []
         block_components = []
-        for ic, t in enumerate(component_names):
-            for k, pair_ij in bas_ij_cache.items():
-                same_component = shell_component_gpu[pair_ij//nbas] == ic
-                pair_ij_t = cp.sort(pair_ij[same_component])
-                if pair_ij_t.size > 0:
-                    bas_ij_blocks.append((k, pair_ij_t))
-                    block_components.append(t)
-        self.bas_ij_cache = bas_ij_cache
+        for t, blocks in zip(component_names, component_blocks):
+            bas_ij_blocks.extend(blocks)
+            block_components.extend([t] * len(blocks))
         self.bas_ij_blocks = bas_ij_blocks
         self.block_components = block_components
         return self

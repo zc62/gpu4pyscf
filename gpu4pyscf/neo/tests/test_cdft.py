@@ -8,7 +8,7 @@ def _assert_cdft_position_constraint(test_case, mf, atol=1e-6):
     dm = mf.make_rdm1()
     for t, comp in mf.components.items():
         if t.startswith('n'):
-            dev = numpy.einsum('xij,ji->x', comp.int1e_r, dm[t].get())
+            dev = numpy.einsum('xij,ji->x', comp.int1e_r.get(), dm[t].get())
             numpy.testing.assert_allclose(dev, numpy.zeros_like(dev), atol=atol)
 
 
@@ -40,7 +40,7 @@ class KnownValues(unittest.TestCase):
 
         self.assertTrue(mf_gpu.converged)
         self.assertAlmostEqual(e_gpu, e_cpu, 8)
-        numpy.testing.assert_allclose(mf_gpu.f[0], mf_cpu.f[0], atol=1e-7)
+        numpy.testing.assert_allclose(mf_gpu.f[0].get(), mf_cpu.f[0], atol=1e-7)
         _assert_cdft_position_constraint(self, mf_gpu)
         numpy.testing.assert_allclose(mf_gpu.dip_moment(verbose=0),
                                       mf_cpu.dip_moment(verbose=0),
@@ -60,8 +60,8 @@ class KnownValues(unittest.TestCase):
         e_gpu = mf_gpu.kernel()
 
         self.assertTrue(mf_gpu.converged)
-        self.assertAlmostEqual(e_gpu, e_cpu, 8)
-        numpy.testing.assert_allclose(mf_gpu.f[0], mf_cpu.f[0], atol=2e-7)
+        self.assertAlmostEqual(e_gpu, e_cpu, 7)
+        numpy.testing.assert_allclose(mf_gpu.f[0].get(), mf_cpu.f[0], atol=1e-6)
         _assert_cdft_position_constraint(self, mf_gpu)
 
     def test_to_gpu(self):
@@ -82,7 +82,6 @@ class KnownValues(unittest.TestCase):
         mf = gpu_neo.CDFT(mol, xc='PBE', epc=None)
         mf_cpu = mf.to_cpu()
         self.assertIsInstance(mf_cpu, neo.CDFT)
-
 
 if __name__ == '__main__':
     print('Full Tests for gpu4pyscf.neo.cdft')

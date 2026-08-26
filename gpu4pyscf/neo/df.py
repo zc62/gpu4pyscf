@@ -1018,7 +1018,7 @@ class _DFNEO:
                 obj.components, hf.InteractionCoulomb, obj.max_memory,
                 obj.direct_scf_tol)
         if hasattr(self, 'f') and self.f is not None:
-            obj.f = np.array(self.f, copy=True)
+            obj.f = cp.array(self.f, copy=True)
         del obj.with_df, obj.ee_only_dfj, obj.df_ne, obj.df_nn, obj.df_ne_component_vint
         return obj
 

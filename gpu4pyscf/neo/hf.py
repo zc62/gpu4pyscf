@@ -1,6 +1,6 @@
 import cupy
 import numpy
-from pyscf import gto
+from pyscf import gto, neo
 from pyscf import lib as pyscf_lib
 from pyscf.data import nist
 from pyscf.neo import hf as hf_cpu
@@ -41,6 +41,193 @@ def _to_gpu(x):
     if isinstance(x, list):
         return [_to_gpu(v) for v in x]
     return x
+
+
+def _grouped_hcore(components, mols, int1e_opt=None):
+    from gpu4pyscf.gto.int3c1e import int1e_grids
+    from gpu4pyscf.neo import int1e, j_engine_3c2e
+
+    component_names = list(components)
+    # Each nuclear component uses the same classical centers but an
+    # independent AO basis.  Build their classical-nucleus potential
+    # integrals in one component-local 3c2e job.
+    auxmol = gto.mole.fakemol_for_charges(
+        next(iter(mols.values())).atom_coords())
+    int3c2e_opt = j_engine_3c2e.Int3c2eOpt(mols, auxmol).build(cutoff=1e-14)
+    atom_charges = {t: mols[t].atom_charges() for t in component_names}
+    if all(numpy.array_equal(atom_charges[component_names[0]], atom_charges[t])
+           for t in component_names[1:]):
+        # The common charge vector has one contraction result per component
+        # because the AO-pair blocks remain component-local.
+        auxvec = cupy.asarray(-atom_charges[component_names[0]], dtype=numpy.float64)
+        auxvec = int3c2e_opt.auxmol.apply_C_dot(auxvec, axis=-1)
+        vext = int3c2e_opt.contract_auxvec(auxvec)
+    else:
+        auxvec = {
+            t: int3c2e_opt.auxmol.apply_C_dot(
+                cupy.asarray(-atom_charges[t], dtype=numpy.float64), axis=-1)
+            for t in component_names}
+        vext = int3c2e_opt.contract_auxvec(auxvec, componentwise=True)
+
+    if int1e_opt is None:
+        int1e_opt = int1e.Int1eOpt(mols)
+    kinetic = int1e_opt.get_kin()
+    hcore = {}
+    for t in component_names:
+        comp = components[t]
+        mol = mols[t]
+        vext_t = int3c2e_opt.component_opts[t].mol.apply_CT_mat_C(vext[t])
+        # This is the original nuclear-component hcore: q*V + T/m.
+        hcore[t] = vext_t * comp.charge + kinetic[t] / comp.mass
+        mm_mol = getattr(getattr(mol, 'super_mol', None), 'mm_mol', None)
+        if mm_mol is not None:
+            hcore[t] -= _mm_charge_integrals(mm_mol, mol, int1e_grids) * comp.charge
+    return hcore
+
+
+def _eig_batch(h, s=None, x=None):
+    if x is None:
+        if h.dtype != s.dtype:
+            s = s.astype(h.dtype)
+        chol = cupy.linalg.cholesky(s)
+        if chol.ndim < h.ndim:
+            chol = cupy.broadcast_to(chol, h.shape)
+        h_orth = cupy.linalg.solve(chol, h)
+        h_orth = cupy.linalg.solve(
+            chol, h_orth.swapaxes(-1, -2).conj()).swapaxes(-1, -2).conj()
+        energy, coeff_orth = cupy.linalg.eigh(h_orth)
+        coeff = cupy.linalg.solve(chol.swapaxes(-1, -2).conj(), coeff_orth)
+    else:
+        h_orth = x.swapaxes(-1, -2).conj() @ h @ x
+        energy, coeff_orth = cupy.linalg.eigh(h_orth)
+        coeff = x @ coeff_orth
+    return energy, coeff
+
+
+def _grouped_eig(components, h, s, overwrite=False, x=None):
+    energy = {}
+    coeff = {}
+    groups = {}
+    # Batched eigh requires equal matrix shapes, dtypes, and either an
+    # orthogonalizer for every component in the group or none of them.
+    for t in components:
+        x_t = None if x is None else x[t]
+        x_key = None if x_t is None else (x_t.shape, x_t.dtype)
+        key = (h[t].shape, h[t].dtype, x_key)
+        groups.setdefault(key, []).append(t)
+    for keys in groups.values():
+        matrices = s if x is None or x[keys[0]] is None else x
+        shared = {}
+        for t in keys:
+            shared.setdefault(matrices[t].data.ptr, []).append(t)
+        eig_groups = [(group, True) for group in shared.values()
+                      if len(group) > 1]
+        unique = [group[0] for group in shared.values() if len(group) == 1]
+        if unique:
+            eig_groups.append((unique, False))
+        for eig_keys, share_matrix in eig_groups:
+            h_batch = cupy.stack([h[t] for t in eig_keys])
+            matrix = matrices[eig_keys[0]] if share_matrix else \
+                cupy.stack([matrices[t] for t in eig_keys])
+            if x is None or x[eig_keys[0]] is None:
+                # SCF.eig calls a two-dimensional generalized eigensolver.
+                energy_batch, coeff_batch = _eig_batch(h_batch, matrix)
+            else:
+                # This is SCF.eig's x^H h x branch with a component batch axis.
+                energy_batch, coeff_batch = _eig_batch(h_batch, x=matrix)
+            for i, t in enumerate(eig_keys):
+                energy[t] = energy_batch[i]
+                coeff[t] = coeff_batch[i]
+    return energy, coeff
+
+
+def _grouped_occ(components, mo_energy):
+    mo_occ = {}
+    groups = {}
+    # Components with the same orbital-vector layout share argsort and scatter
+    # operations while retaining their own selected nuclear state.
+    for t in components:
+        key = (mo_energy[t].shape, mo_energy[t].dtype)
+        groups.setdefault(key, []).append(t)
+    for keys in groups.values():
+        energy = cupy.stack([mo_energy[t] for t in keys])
+        order = cupy.argsort(energy, axis=1)
+        occ = cupy.zeros_like(energy)
+        rows = cupy.arange(len(keys))
+        states = cupy.asarray([components[t].nuc_occ_state for t in keys])
+        # Unlike the electronic get_occ, each distinguishable nucleus occupies
+        # nuc_occ_state with its component's nnuc occupation.
+        occ[rows, order[rows, states]] = cupy.asarray(
+            [components[t].mol.nnuc for t in keys])
+        if any(components[t].verbose >= logger.INFO for t in keys):
+            frontier = energy[rows[:,None], order[:,:2]].get()
+            for i, t in enumerate(keys):
+                comp = components[t]
+                if comp.verbose >= logger.INFO:
+                    homo, lumo = frontier[i]
+                    gap = (lumo - homo) * nist.HARTREE2EV
+                    comp.scf_summary['gap'] = gap
+                    if homo+1e-3 > lumo:
+                        logger.warn(comp, 'CNEO NUC HOMO %.15g == LUMO %.15g',
+                                    homo, lumo)
+                    else:
+                        logger.info(comp, '  CNEO NUC HOMO = %.15g  LUMO = %.15g  gap/eV = %.5f',
+                                    homo, lumo, gap)
+        for i, t in enumerate(keys):
+            mo_occ[t] = occ[i]
+    return mo_occ
+
+
+def _grouped_rdm1(components, mo_coeff, mo_occ):
+    dm = {}
+    groups = {}
+    # Keep separate component-local AO matrices; only equal-sized matrices are
+    # stacked along a temporary batch axis.
+    for t in components:
+        key = (mo_coeff[t].shape, mo_coeff[t].dtype)
+        groups.setdefault(key, []).append(t)
+    for keys in groups.values():
+        coeff = cupy.stack([mo_coeff[t] for t in keys])
+        occ = cupy.stack([mo_occ[t] for t in keys])
+        occupied_index = cupy.argmax(occ, axis=1)
+        gather_index = cupy.broadcast_to(
+            occupied_index[:,None,None], (len(keys), coeff.shape[1], 1))
+        occupied_coeff = cupy.take_along_axis(coeff, gather_index, axis=2)
+        occupied_value = cupy.max(occ, axis=1)
+        # Nuclear get_occ selects one orbital.  This is the original
+        # C_occ n C_occ^H density formula evaluated for all components.
+        dm_batch = cupy.einsum('npi,nqi,n->npq', occupied_coeff,
+                               occupied_coeff.conj(), occupied_value)
+        for i, t in enumerate(keys):
+            dm[t] = tag_array(dm_batch[i], occ_coeff=occupied_coeff[i],
+                              mo_occ=mo_occ[t], mo_coeff=mo_coeff[t])
+    return dm
+
+
+def _grouped_grad(components, mo_coeff, mo_occ, fock):
+    grad = {}
+    groups = {}
+    # Equal orbital dimensions give each component the same occupied-virtual
+    # gradient layout, so the original contraction can use a batch axis.
+    for t in components:
+        key = (mo_coeff[t].shape, mo_coeff[t].dtype)
+        groups.setdefault(key, []).append(t)
+    for keys in groups.values():
+        coeff = cupy.stack([mo_coeff[t] for t in keys])
+        occ = cupy.stack([mo_occ[t] for t in keys])
+        fock_batch = cupy.stack([fock[t] for t in keys])
+        occidx = occ > 0
+        viridx = ~occidx
+        # This is scf.hf.get_grad's 2*(C_vir^H F C_occ).ravel() expression.
+        coeff_t = coeff.swapaxes(1, 2)
+        orbo = coeff_t[occidx].reshape(len(keys), -1, coeff.shape[1]).swapaxes(1, 2)
+        orbv = coeff_t[viridx].reshape(len(keys), -1, coeff.shape[1]).swapaxes(1, 2)
+        grad_batch = cupy.matmul(orbv.conj().swapaxes(1, 2),
+                                 cupy.matmul(fock_batch, orbo)) * 2
+        grad_batch = grad_batch.reshape(len(keys), -1)
+        for i, t in enumerate(keys):
+            grad[t] = grad_batch[i]
+    return grad
 
 
 def general_scf(method, charge=1, mass=1, is_nucleus=False, nuc_occ_state=0):
@@ -275,7 +462,8 @@ def _tag_vint_full_delta(vint_full, vint_delta, components):
 
 def get_fock(mf, h1e=None, s1e=None, vhf=None, dm=None, cycle=-1,
              diis=None, diis_start_cycle=None, level_shift_factor=None,
-             damp_factor=None, fock_last=None, diis_pos='both', diis_type=3):
+             damp_factor=None, fock_last=None, diis_pos='both', diis_type=4,
+             constraint_update=True):
     if h1e is None: h1e = mf.get_hcore()
     if vhf is None: vhf = mf.get_veff(mf.mol, dm)
     h1e = {t: cupy.asarray(h1e[t]) for t in h1e}
@@ -286,33 +474,24 @@ def get_fock(mf, h1e=None, s1e=None, vhf=None, dm=None, cycle=-1,
         if not t.startswith('n') and isinstance(comp, scf_gpu.uhf.UHF) and f[t].ndim == 2:
             f[t] = cupy.asarray((f[t],) * 2)
 
+    if diis_start_cycle is None:
+        diis_start_cycle = mf.diis_start_cycle
+
     from gpu4pyscf.neo import cdft
     is_cdft = isinstance(mf, cdft.CDFT)
     f0 = None
+    position_error = None
     # CNEO constraint term
     # NOTE: even if not using DIIS, we still optimize f.
     if is_cdft:
         if diis_pos == 'pre' or diis_pos == 'both' or (cycle < 0 and diis is None):
-            # optimize the Lagrange multiplier in CNEO
-            for t, comp in mf.components.items():
-                if t.startswith('n'):
-                    ia = comp.mol.atom_index
-                    opt = cdft.solve_constraint(comp, _to_cpu(f[t]), _to_cpu(s1e[t]), mf.f[ia])
-                    mf.f[ia] = opt.x
-                    if opt.success:
-                        logger.debug(mf, 'CNEO NUC constraint optimization succeeded.')
-                        logger.debug(mf, 'Lagrange multiplier of %s(%i) atom: %s' %
-                                     (mf.mol.atom_symbol(ia), ia, mf.f[ia]))
-                        logger.debug(mf, 'Position deviation: %s', opt.fun)
-                    else:
-                        logger.warn(mf, 'CNEO NUC constraint optimization failed!')
-                        logger.warn(mf, f'scipy.optimize.least_squares message: {opt.message}')
-                        logger.warn(mf, 'Lagrange multiplier of %s(%i) atom: %s' %
-                                    (mf.mol.atom_symbol(ia), ia, mf.f[ia]))
-                        logger.warn(mf, 'Position deviation: %s', opt.fun)
+            if constraint_update:
+                # optimize the Lagrange multiplier in CNEO
+                position_error = cdft.update_lagrange_multipliers(
+                    mf, f, s1e, one_step=diis_type == 4 and cycle >= 0)
 
         # For DIIS type 1, preserve original matrices
-        if diis_type == 1:
+        if diis_type == 1 and diis is not None and cycle >= diis_start_cycle:
             f0 = f.copy()
 
         fock_add = mf.get_fock_add_cdft()
@@ -331,8 +510,6 @@ def get_fock(mf, h1e=None, s1e=None, vhf=None, dm=None, cycle=-1,
                 and isinstance(dm[t], cupy.ndarray) and dm[t].ndim == 2:
             dm[t] = cupy.asarray((dm[t]*0.5,) * 2)
 
-    if diis_start_cycle is None:
-        diis_start_cycle = mf.diis_start_cycle
     if damp_factor is None:
         damp_factor = mf.damp
     if damp_factor is not None and 0 <= cycle < diis_start_cycle-1 and fock_last is not None \
@@ -345,6 +522,16 @@ def get_fock(mf, h1e=None, s1e=None, vhf=None, dm=None, cycle=-1,
             shapes = {k: f[k].shape for k in keys}
             if getattr(diis, 'damp', 0):
                 raise NotImplementedError('DIIS damping for CDFT is not implemented.')
+            if diis_type != 1:
+                variables = [f[k].ravel() for k in keys]
+                if diis_type == 4:
+                    nuclear_keys = sorted(t for t in mf.components
+                                          if t.startswith('n'))
+                    atom_indices = [mf.components[t].mol.atom_index
+                                    for t in nuclear_keys]
+                    variables.append(mf.f[atom_indices].ravel())
+                f_flat = cupy.concatenate(variables)
+
             if diis_type == 1:
                 f0_flat = cupy.concatenate([f0[k].ravel() for k in keys])
                 # Type-1 CDFT extrapolates f0_flat while building the error
@@ -353,15 +540,20 @@ def get_fock(mf, h1e=None, s1e=None, vhf=None, dm=None, cycle=-1,
                 errvec = diis._sdf_err_vec(s1e, dm, f)
                 f_flat = lib.diis.DIIS.update(diis, f0_flat, xerr=errvec)
             elif diis_type == 2:
-                f_flat = cupy.concatenate([f[k].ravel() for k in keys])
                 f_flat = lib.diis.DIIS.update(diis, f_flat)
             elif diis_type == 3:
                 # Equivalent to packing f and calling
                 # lib.diis.DIIS.update(diis, f_flat, xerr=diis._sdf_err_vec(s1e, dm, f)).
                 f = diis.update(s1e, dm, f)
                 f_flat = None
+            elif diis_type == 4:
+                fock_error = diis._sdf_err_vec(s1e, dm, f)
+                if position_error is None:
+                    position_error = cdft.get_position_error(mf, f, s1e)
+                error = cupy.concatenate((fock_error, position_error))
+                f_flat = lib.diis.DIIS.update(diis, f_flat, xerr=error)
             else:
-                print("\nWARN: Unknow CDFT DIIS type, NO DIIS IS USED!!!\n")
+                logger.warn(mf, 'Unknown CDFT DIIS type %s; DIIS is disabled', diis_type)
                 f_flat = None
 
             if f_flat is not None:
@@ -378,6 +570,12 @@ def get_fock(mf, h1e=None, s1e=None, vhf=None, dm=None, cycle=-1,
                     offset += size
                 f = f_new
 
+                if diis_type == 4:
+                    size = len(nuclear_keys) * 3
+                    mf.f[atom_indices] = f_flat[offset:offset+size].reshape(-1,3)
+                    offset += size
+                    fock_add = mf.get_fock_add_cdft()
+
             if diis_type == 1:
                 for t in fock_add:
                     f[t] += fock_add[t]
@@ -390,7 +588,8 @@ def get_fock(mf, h1e=None, s1e=None, vhf=None, dm=None, cycle=-1,
         raise NotImplementedError('Level shift for multi-component SCF is not yet implemented.')
 
     # Post-DIIS CDFT optimization
-    if is_cdft and (diis_pos == 'post' or diis_pos == 'both'):
+    if (is_cdft and constraint_update and
+            (diis_pos == 'post' or diis_pos == 'both')):
         f0 = {}
         for t in f:
             if t.startswith('n'):
@@ -398,22 +597,8 @@ def get_fock(mf, h1e=None, s1e=None, vhf=None, dm=None, cycle=-1,
             else:
                 f0[t] = f[t]
 
-        for t, comp in mf.components.items():
-            if t.startswith('n'):
-                ia = comp.mol.atom_index
-                opt = cdft.solve_constraint(comp, _to_cpu(f0[t]), _to_cpu(s1e[t]), mf.f[ia])
-                mf.f[ia] = opt.x
-                if opt.success:
-                    logger.debug(mf, 'CNEO NUC constraint optimization succeeded.')
-                    logger.debug(mf, 'Lagrange multiplier of %s(%i) atom: %s' %
-                                 (mf.mol.atom_symbol(ia), ia, mf.f[ia]))
-                    logger.debug(mf, 'Position deviation: %s', opt.fun)
-                else:
-                    logger.warn(mf, 'CNEO NUC constraint optimization failed!')
-                    logger.warn(mf, f'scipy.optimize.least_squares message: {opt.message}')
-                    logger.warn(mf, 'Lagrange multiplier of %s(%i) atom: %s' %
-                                (mf.mol.atom_symbol(ia), ia, mf.f[ia]))
-                    logger.warn(mf, 'Position deviation: %s', opt.fun)
+        cdft.update_lagrange_multipliers(mf, f0, s1e,
+                                         one_step=diis_type == 4)
 
         fock_add = mf.get_fock_add_cdft()
         for t in fock_add:
@@ -504,7 +689,8 @@ def _kernel(mf, conv_tol=1e-10, conv_tol_grad=None,
         dm = {t: asarray(dm[t]) for t in dm} # Remove the attached attributes
         t1 = log.timer_debug1('veff', *t1)
 
-        fock = mf.get_fock(h1e, s1e, vhf, dm)  # = h1e + vhf, no DIIS
+        fock = mf.get_fock(h1e, s1e, vhf, dm,
+                           constraint_update=False)  # = h1e + vhf, no DIIS
         e_tot = mf.energy_tot(dm, h1e, vhf)
         grad = mf.get_grad(mo_coeff, mo_occ, fock)
         norm_gorb = {t: cupy.linalg.norm(grad[t]) for t in grad}
@@ -618,6 +804,94 @@ def energy_tot(mf, dm=None, h1e=None, vhf=None):
     return e_tot
 
 
+def _grouped_energy(components, dm, h1e, vhf):
+    e_elec = 0
+    e2 = 0
+    groups = {}
+    # HF and KS effective potentials carry different energy metadata.  Group
+    # only components with equal local AO layouts and the same method type.
+    for t, comp in components.items():
+        key = (dm[t].shape, dm[t].dtype,
+               isinstance(comp, scf_gpu.hf.KohnShamDFT))
+        groups.setdefault(key, []).append(t)
+    for keys in groups.values():
+        # The leading axis batches independent component-local matrices; no
+        # cross-component AO blocks are formed.
+        dm_batch = cupy.stack([dm[t] for t in keys])
+        h1e_batch = cupy.stack([h1e[t] for t in keys])
+        e1 = cupy.einsum('nij,nji->n', h1e_batch, dm_batch).real
+        if isinstance(components[keys[0]], scf_gpu.hf.KohnShamDFT):
+            # KS get_veff already records Coulomb and XC energies.
+            e1 = e1.get()
+            energies = [(e1[i], vhf[t].ecoul.real + vhf[t].exc.real)
+                        for i, t in enumerate(keys)]
+        else:
+            # Preserve scf.hf.energy_elec's E2 = Tr[V_hf D]/2 contraction.
+            vhf_batch = cupy.stack([vhf[t] for t in keys])
+            e2_batch = cupy.einsum(
+                'nij,nji->n', vhf_batch, dm_batch).real * .5
+            energies = cupy.stack((e1, e2_batch), axis=1).get()
+        for i, t in enumerate(keys):
+            comp = components[t]
+            e1_t, e2_t = energies[i]
+            ecoul = vhf[t].ecoul.real
+            comp.scf_summary['e1'] = e1_t
+            comp.scf_summary['e2'] = e2_t
+            comp.scf_summary['coul'] = ecoul
+            if hasattr(vhf[t], 'exc'):
+                comp.scf_summary['exc'] = vhf[t].exc.real
+            else:
+                comp.scf_summary['exc'] = e2_t - ecoul
+            e_elec += e1_t + e2_t
+            e2 += e2_t
+    return e_elec, e2
+
+
+def energy_elec(mf, dm=None, h1e=None, vhf=None):
+    if dm is None: dm = mf.make_rdm1()
+    if h1e is None: h1e = mf.get_hcore()
+    if vhf is None: vhf = mf.get_veff(mf.mol, dm)
+    mf.scf_summary['e1'] = 0
+    mf.scf_summary['e2'] = 0
+    e_elec = 0
+    e_coul = 0
+    ecoul = 0
+    with_ecoul = True
+    nuclear_components = {t: comp for t, comp in mf.components.items()
+                          if t.startswith('n')}
+    for t, comp in mf.components.items():
+        if t.startswith('n'):
+            continue
+        logger.debug(mf, f'Component: {t}')
+        e_elec_t, e_coul_t = comp.energy_elec(dm[t], h1e[t], vhf[t])
+        e_elec += e_elec_t
+        e_coul += e_coul_t
+        mf.scf_summary['e1'] += comp.scf_summary['e1']
+        mf.scf_summary['e2'] += comp.scf_summary['e2']
+        if hasattr(vhf[t], 'ecoul'):
+            ecoul += vhf[t].ecoul.real
+        else:
+            with_ecoul = False
+    if nuclear_components:
+        e_elec_n, e_coul_n = _grouped_energy(
+            nuclear_components, dm, h1e, vhf)
+        e_elec += e_elec_n
+        e_coul += e_coul_n
+        for t in nuclear_components:
+            comp = nuclear_components[t]
+            mf.scf_summary['e1'] += comp.scf_summary['e1']
+            mf.scf_summary['e2'] += comp.scf_summary['e2']
+            if hasattr(vhf[t], 'ecoul'):
+                ecoul += vhf[t].ecoul.real
+            else:
+                with_ecoul = False
+    if with_ecoul:
+        mf.scf_summary['coul'] = ecoul
+        exx = mf.scf_summary['e2'] - ecoul
+        mf.scf_summary['exc'] = exx
+    return e_elec, e_coul
+
+
 class HF(scf_gpu.hf.SCF):
     '''Multicomponent Hartree-Fock'''
 
@@ -656,26 +930,167 @@ class HF(scf_gpu.hf.SCF):
                         self.__class__.__name__)
         return self
 
-    check_linear_dependency = hf_cpu.HF.check_linear_dependency
+    def check_linear_dependency(self, s, verbose=None):
+        x = {}
+        nuclear_representatives = {}
+        for t, comp in self.components.items():
+            if t.startswith('n'):
+                representative = nuclear_representatives.setdefault(s[t].data.ptr, t)
+                if representative != t:
+                    x[t] = x[representative]
+                    continue
+            x[t] = comp.check_linear_dependency(s[t], verbose)
+        return x
     check_sanity = hf_cpu.HF.check_sanity
     build = hf_cpu.HF.build
-    eig = hf_cpu.HF.eig
-    # TODO: Batch component-local one-electron integrals without forming
-    # cross-component AO blocks.  The CPU helpers call each GPU component
-    # separately, giving O(ncomponent) kernel-launch overhead.
-    get_hcore = hf_cpu.HF.get_hcore
-    get_ovlp = hf_cpu.HF.get_ovlp
-    get_occ = hf_cpu.HF.get_occ
-    get_grad = hf_cpu.HF.get_grad
-    get_init_guess = hf_cpu.HF.get_init_guess
+
+    def eig(self, h, s, overwrite=False, x=None):
+        energy = {}
+        coeff = {}
+        nuclear_components = {t: comp for t, comp in self.components.items()
+                              if t.startswith('n')}
+        # Preserve each nonnuclear component's own eig implementation.
+        for t, comp in self.components.items():
+            if not t.startswith('n'):
+                x_t = None if x is None else x[t]
+                energy[t], coeff[t] = comp.eig(
+                    h[t], s[t], overwrite=overwrite, x=x_t)
+        if nuclear_components:
+            # Nuclear matrices are independent but often equal-sized, allowing
+            # the same eig operations to share a leading batch dimension.
+            energy_n, coeff_n = _grouped_eig(
+                nuclear_components, h, s, overwrite=overwrite, x=x)
+            energy.update(energy_n)
+            coeff.update(coeff_n)
+        return energy, coeff
+
+    def get_hcore(self, mol=None):
+        if mol is None: mol = self.mol
+        hcore = {}
+        nuclear_mols = {t: comp for t, comp in mol.components.items()
+                        if t.startswith('n')}
+        for t, comp in mol.components.items():
+            if not t.startswith('n'):
+                hcore[t] = self.components[t].get_hcore(mol=comp)
+        if nuclear_mols:
+            nuclear_components = {t: self.components[t] for t in nuclear_mols}
+            hcore.update(_grouped_hcore(nuclear_components, nuclear_mols))
+        return hcore
+
+    def get_ovlp(self, mol=None):
+        from gpu4pyscf.neo import int1e
+        if mol is None: mol = self.mol
+        ovlp = {}
+        nuclear_mols = {t: comp for t, comp in mol.components.items()
+                        if t.startswith('n')}
+        for t, comp in mol.components.items():
+            if not t.startswith('n'):
+                ovlp[t] = self.components[t].get_ovlp(mol=comp)
+        if nuclear_mols:
+            ovlp.update(int1e.Int1eOpt(nuclear_mols).get_ovlp())
+        return ovlp
+
+    def get_occ(self, mo_energy=None, mo_coeff=None):
+        if mo_energy is None: mo_energy = self.mo_energy
+        mo_occ = {}
+        nuclear_components = {t: comp for t, comp in self.components.items()
+                              if t.startswith('n')}
+        for t, comp in self.components.items():
+            if not t.startswith('n'):
+                coeff = mo_coeff.get(t) if mo_coeff is not None and \
+                        isinstance(mo_coeff, dict) else None
+                mo_occ[t] = comp.get_occ(mo_energy[t], coeff)
+        # Nuclear occupations use nuc_occ_state rather than the electronic
+        # Aufbau occupation implemented by the component SCF class.
+        mo_occ.update(_grouped_occ(nuclear_components, mo_energy))
+        if 'gap' in self.components['e'].scf_summary:
+            self.scf_summary['gap'] = self.components['e'].scf_summary['gap']
+        return mo_occ
+
+    def get_grad(self, mo_coeff, mo_occ, fock):
+        grad = {}
+        nuclear_components = {t: comp for t, comp in self.components.items()
+                              if t.startswith('n')}
+        for t, comp in self.components.items():
+            if not t.startswith('n'):
+                grad[t] = comp.get_grad(mo_coeff[t], mo_occ[t], fock[t])
+        # Nuclear occupied-virtual contractions share a batch dimension when
+        # their orbital dimensions agree.
+        grad.update(_grouped_grad(nuclear_components, mo_coeff, mo_occ, fock))
+        return grad
+
+    def get_init_guess(self, mol=None, key='minao', **kwargs):
+        from gpu4pyscf.neo import int1e
+        dm_guess = {}
+        if not isinstance(key, str):
+            if isinstance(key, dict): # several components are given
+                dm_guess = key
+            else: # numpy.ndarray
+                dm_guess['e'] = key   # only e_guess is provided
+            key = 'minao' # for remaining components, use default minao guess
+        if mol is None: mol = self.mol
+        if 'e' not in dm_guess:
+            dm_guess['e'] = self.components['e'].get_init_guess(
+                mol.components['e'], key, **kwargs)
+
+        if 'p' in self.components and 'p' not in dm_guess:
+            dm_guess['p'] = self.components['p'].get_init_guess(
+                mol.components['p'], key, **kwargs)
+
+        nuc_types = tuple(t for t in self.components
+                          if t.startswith('n') and t not in dm_guess)
+        vint = self._get_init_guess_vint(nuc_types, dm_guess) if nuc_types else {}
+        nuc_mols = {}
+        for t in nuc_types:
+            comp = self.components[t]
+            mol_tmp = neo.Mole()
+            # Do not invoke possibly expensive QMMM during init guess
+            mol_tmp.build(quantum_nuc=[comp.mol.atom_index],
+                          nuc_basis=mol.nuclear_basis,
+                          mm_mol=None, dump_input=False, parse_arg=False,
+                          verbose=mol.verbose, output=mol.output,
+                          max_memory=mol.max_memory, atom=mol.atom, unit=mol.unit,
+                          nucmod=mol.nucmod, ecp=mol.ecp, pseudo=mol.pseudo,
+                          charge=mol.charge, spin=mol.spin, symmetry=mol.symmetry,
+                          symmetry_subgroup=mol.symmetry_subgroup, cart=mol.cart,
+                          magmom=mol.magmom)
+            nuc_mols[t] = mol_tmp.components[t]
+
+        if nuc_mols:
+            nuc_components = {t: self.components[t] for t in nuc_types}
+            int1e_opt = int1e.Int1eOpt(nuc_mols)
+            hcore = _grouped_hcore(nuc_components, nuc_mols, int1e_opt)
+            ovlp = int1e_opt.get_ovlp()
+            fock = {t: hcore[t] + vint[t] for t in nuc_types}
+            mo_energy, mo_coeff = _grouped_eig(
+                nuc_components, fock, ovlp)
+            mo_occ = _grouped_occ(nuc_components, mo_energy)
+            dm_guess.update(_grouped_rdm1(
+                nuc_components, mo_coeff, mo_occ))
+        return dm_guess
 
     def _get_init_guess_vint(self, output_components, dm_guess):
         dm_guess = _to_cpu(dm_guess)
         vint = hf_cpu.HF._get_init_guess_vint(self, output_components, dm_guess)
         return {t: cupy.asarray(v) for t, v in vint.items()}
 
-    make_rdm1 = hf_cpu.HF.make_rdm1
-    energy_elec = hf_cpu.HF.energy_elec
+    def make_rdm1(self, mo_coeff=None, mo_occ=None, **kwargs):
+        if mo_coeff is None: mo_coeff = self.mo_coeff
+        if mo_occ is None: mo_occ = self.mo_occ
+        dm = {}
+        nuclear_components = {t: comp for t, comp in self.components.items()
+                              if t.startswith('n')}
+        for t, comp in self.components.items():
+            if not t.startswith('n'):
+                coeff = comp.mo_coeff if mo_coeff is None else mo_coeff[t]
+                occ = comp.mo_occ if mo_occ is None else mo_occ[t]
+                dm[t] = comp.make_rdm1(coeff, occ, **kwargs)
+        # Keep nuclear density matrices component-local while batching equal
+        # dimensions in the contraction.
+        dm.update(_grouped_rdm1(nuclear_components, mo_coeff, mo_occ))
+        return dm
+
+    energy_elec = energy_elec
     energy_tot = energy_tot
     energy_nuc = hf_cpu.HF.energy_nuc
     kernel = scf = scf
@@ -848,7 +1263,7 @@ class HF(scf_gpu.hf.SCF):
     def copy(self):
         new = super().copy()
         if hasattr(self, 'f') and self.f is not None:
-            new.f = numpy.array(self.f, copy=True)
+            new.f = cupy.array(self.f, copy=True)
         new.components = {}
         for t, comp in self.components.items():
             new.components[t] = general_scf(comp.undo_component().copy(), charge=comp.charge,

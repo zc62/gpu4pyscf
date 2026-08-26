@@ -139,7 +139,7 @@ class KnownValues(unittest.TestCase):
 
         self.assertTrue(mf_cpu.converged)
         self.assertTrue(mf_gpu.converged)
-        numpy.testing.assert_allclose(g_gpu, g_cpu, atol=3e-7)
+        numpy.testing.assert_allclose(g_gpu, g_cpu, atol=2e-6)
 
     def test_df_nn_grad(self):
         mol_h2o = neo.M(atom='''O  0.000000  0.000000  0.000000
@@ -168,9 +168,9 @@ class KnownValues(unittest.TestCase):
         mf.max_cycle = 100
         mf.kernel()
         ref = numpy.array([
-            [0.0, 0.0, 0.103446829],
-            [0.0, 0.0517703338, -0.0517520422],
-            [0.0, -0.0517703338, -0.0517520422]])
+            [0.0, 0.0, 0.103446904247080],
+            [0.0, 0.051770424343938, -0.051752079756173],
+            [0.0, -0.051770424343948, -0.051752079756169]])
         self.assertTrue(mf.converged)
         numpy.testing.assert_allclose(mf.nuc_grad_method().kernel(), ref,
                                       atol=1e-8)

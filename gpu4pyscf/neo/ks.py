@@ -2,7 +2,6 @@ import copy
 import warnings
 from concurrent.futures import ThreadPoolExecutor
 import cupy
-import numpy
 from pyscf import gto
 from pyscf import scf as scf_cpu
 from pyscf.data import nist
@@ -401,7 +400,46 @@ class KS(hf.HF):
         self.grids = None
         self._elec_grids_hash = None
 
-    energy_elec = ks_cpu.KS.energy_elec
+    def energy_elec(self, dm=None, h1e=None, vhf=None):
+        if dm is None: dm = self.make_rdm1()
+        if h1e is None: h1e = self.get_hcore()
+        if vhf is None: vhf = self.get_veff(self.mol, dm)
+        self.scf_summary['e1'] = 0
+        self.scf_summary['e2'] = 0
+        self.scf_summary['coul'] = 0
+        self.scf_summary['exc'] = 0
+        e_elec = 0
+        e2 = 0
+        nuclear_components = {t: comp for t, comp in self.components.items()
+                              if t.startswith('n')}
+        for t, comp in self.components.items():
+            if t.startswith('n'):
+                continue
+            e_elec_t, e2_t = comp.energy_elec(dm[t], h1e[t], vhf[t])
+            e_elec += e_elec_t
+            e2 += e2_t
+            self.scf_summary['e1'] += comp.scf_summary['e1']
+            self.scf_summary['e2'] += comp.scf_summary['e2']
+            if hasattr(vhf[t], 'exc'):
+                self.scf_summary['coul'] += comp.scf_summary['coul']
+                self.scf_summary['exc'] += comp.scf_summary['exc']
+            elif 'e2' in comp.scf_summary:
+                self.scf_summary['coul'] += comp.scf_summary['e2']
+        if nuclear_components:
+            e_elec_n, e2_n = hf._grouped_energy(
+                nuclear_components, dm, h1e, vhf)
+            e_elec += e_elec_n
+            e2 += e2_n
+            for t in nuclear_components:
+                comp = nuclear_components[t]
+                self.scf_summary['e1'] += comp.scf_summary['e1']
+                self.scf_summary['e2'] += comp.scf_summary['e2']
+                if hasattr(vhf[t], 'exc'):
+                    self.scf_summary['coul'] += comp.scf_summary['coul']
+                    self.scf_summary['exc'] += comp.scf_summary['exc']
+                elif 'e2' in comp.scf_summary:
+                    self.scf_summary['coul'] += comp.scf_summary['e2']
+        return e_elec, e2
 
     def _get_vint_fast(self, mol=None, dm=None, dm_last=None, vhf_last=None):
         if mol is None: mol = self.mol
@@ -423,7 +461,7 @@ class KS(hf.HF):
     def copy(self):
         new = scf.hf.SCF.copy(self)
         if hasattr(self, 'f') and self.f is not None:
-            new.f = numpy.array(self.f, copy=True)
+            new.f = cupy.array(self.f, copy=True)
 
         new.components = {}
         for t, comp in self.components.items():
