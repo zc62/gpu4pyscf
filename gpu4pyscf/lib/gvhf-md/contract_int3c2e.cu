@@ -535,6 +535,8 @@ void unrolled_contract_int3c2e(RysIntEnvVars& envs, JKMatrix& jk,
     }
 }
 
+// Copied from unrolled_contract_int3c2e; the final reduction keeps each
+// shell pair's component output instead of summing different nuclei together.
 template <int LK, int RT_SIZE> __device__ inline
 void unrolled_contract_int3c2e_multi_out(RysIntEnvVars& envs, JKMatrix& jk,
                                          double **vj, int *pair_component,
@@ -967,6 +969,8 @@ void contract_auxvec_kernel(RysIntEnvVars envs, JKMatrix jk,
     }
 }
 
+// Copied from unroll_contract_auxvec. Each shell pair selects its component's
+// auxiliary vector and its own shared-memory cache within the thread block.
 template <int LK, int IJ_SIZE, int RT_SIZE> __device__ inline
 void unroll_contract_auxvec_multi_in(RysIntEnvVars& envs, JKMatrix& jk,
                                      double **auxvecs, int *pair_component,

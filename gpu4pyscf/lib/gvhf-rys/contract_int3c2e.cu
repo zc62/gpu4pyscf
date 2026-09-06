@@ -168,6 +168,8 @@ void contract_int3c2e_dm_kernel(double *out, double *dm, int n_dm, int naux,
     int gout_id = thread_id / nst_per_block;
     int sp_id = thread_id % nst_per_block;
 
+    // Each scheduled block contains pairs from one component, so its threads
+    // share one density-matrix pointer and one auxiliary-output pointer.
     int component = componentwise ? pair_component[shl_pair0] : 0;
     size_t nao = componentwise ? component_nao[component] : ao_loc[nbas];
     if (componentwise) {

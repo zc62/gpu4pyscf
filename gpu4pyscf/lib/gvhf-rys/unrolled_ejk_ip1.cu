@@ -62,7 +62,7 @@ while (1) {
                            q_cond_ij, q_cond_kl,
                            s_cond_ij, s_cond_kl, diffuse_exps,
                            (int *)shared_memory, jk, envs, bounds,
-                        component_id, exclude_component_self);
+                           component_id, exclude_component_self);
     }
     if (ntasks == 0) {
         continue;
@@ -358,7 +358,7 @@ while (1) {
                            q_cond_ij, q_cond_kl,
                            s_cond_ij, s_cond_kl, diffuse_exps,
                            (int *)shared_memory, jk, envs, bounds,
-                        component_id, exclude_component_self);
+                           component_id, exclude_component_self);
     }
     if (ntasks == 0) {
         continue;
@@ -745,7 +745,7 @@ while (1) {
                            q_cond_ij, q_cond_kl,
                            s_cond_ij, s_cond_kl, diffuse_exps,
                            (int *)shared_memory, jk, envs, bounds,
-                        component_id, exclude_component_self);
+                           component_id, exclude_component_self);
     }
     if (ntasks == 0) {
         continue;
@@ -1391,7 +1391,7 @@ while (1) {
                            q_cond_ij, q_cond_kl,
                            s_cond_ij, s_cond_kl, diffuse_exps,
                            (int *)shared_memory, jk, envs, bounds,
-                        component_id, exclude_component_self);
+                           component_id, exclude_component_self);
     }
     if (ntasks == 0) {
         continue;
@@ -2811,7 +2811,7 @@ while (1) {
                            q_cond_ij, q_cond_kl,
                            s_cond_ij, s_cond_kl, diffuse_exps,
                            (int *)shared_memory, jk, envs, bounds,
-                        component_id, exclude_component_self);
+                           component_id, exclude_component_self);
     }
     if (ntasks == 0) {
         continue;
@@ -3465,7 +3465,7 @@ while (1) {
                            q_cond_ij, q_cond_kl,
                            s_cond_ij, s_cond_kl, diffuse_exps,
                            (int *)shared_memory, jk, envs, bounds,
-                        component_id, exclude_component_self);
+                           component_id, exclude_component_self);
     }
     if (ntasks == 0) {
         continue;
@@ -4895,7 +4895,7 @@ while (1) {
                            q_cond_ij, q_cond_kl,
                            s_cond_ij, s_cond_kl, diffuse_exps,
                            (int *)shared_memory, jk, envs, bounds,
-                        component_id, exclude_component_self);
+                           component_id, exclude_component_self);
     }
     if (ntasks == 0) {
         continue;
@@ -6908,7 +6908,7 @@ while (1) {
                            q_cond_ij, q_cond_kl,
                            s_cond_ij, s_cond_kl, diffuse_exps,
                            (int *)shared_memory, jk, envs, bounds,
-                        component_id, exclude_component_self);
+                           component_id, exclude_component_self);
     }
     if (ntasks == 0) {
         continue;
@@ -7424,7 +7424,7 @@ while (1) {
                            q_cond_ij, q_cond_kl,
                            s_cond_ij, s_cond_kl, diffuse_exps,
                            (int *)shared_memory, jk, envs, bounds,
-                        component_id, exclude_component_self);
+                           component_id, exclude_component_self);
     }
     if (ntasks == 0) {
         continue;
@@ -8455,7 +8455,7 @@ while (1) {
                            q_cond_ij, q_cond_kl,
                            s_cond_ij, s_cond_kl, diffuse_exps,
                            (int *)shared_memory, jk, envs, bounds,
-                        component_id, exclude_component_self);
+                           component_id, exclude_component_self);
     }
     if (ntasks == 0) {
         continue;
@@ -9893,7 +9893,7 @@ while (1) {
                            q_cond_ij, q_cond_kl,
                            s_cond_ij, s_cond_kl, diffuse_exps,
                            (int *)shared_memory, jk, envs, bounds,
-                        component_id, exclude_component_self);
+                           component_id, exclude_component_self);
     }
     if (ntasks == 0) {
         continue;
@@ -11683,7 +11683,7 @@ while (1) {
                            q_cond_ij, q_cond_kl,
                            s_cond_ij, s_cond_kl, diffuse_exps,
                            (int *)shared_memory, jk, envs, bounds,
-                        component_id, exclude_component_self);
+                           component_id, exclude_component_self);
     }
     if (ntasks == 0) {
         continue;
@@ -14186,7 +14186,7 @@ while (1) {
                            q_cond_ij, q_cond_kl,
                            s_cond_ij, s_cond_kl, diffuse_exps,
                            (int *)shared_memory, jk, envs, bounds,
-                        component_id, exclude_component_self);
+                           component_id, exclude_component_self);
     }
     if (ntasks == 0) {
         continue;
@@ -15225,7 +15225,7 @@ while (1) {
                            q_cond_ij, q_cond_kl,
                            s_cond_ij, s_cond_kl, diffuse_exps,
                            (int *)shared_memory, jk, envs, bounds,
-                        component_id, exclude_component_self);
+                           component_id, exclude_component_self);
     }
     if (ntasks == 0) {
         continue;
@@ -16659,7 +16659,7 @@ while (1) {
                            q_cond_ij, q_cond_kl,
                            s_cond_ij, s_cond_kl, diffuse_exps,
                            (int *)shared_memory, jk, envs, bounds,
-                        component_id, exclude_component_self);
+                           component_id, exclude_component_self);
     }
     if (ntasks == 0) {
         continue;
@@ -20261,7 +20261,7 @@ while (1) {
                            q_cond_ij, q_cond_kl,
                            s_cond_ij, s_cond_kl, diffuse_exps,
                            (int *)shared_memory, jk, envs, bounds,
-                        component_id, exclude_component_self);
+                           component_id, exclude_component_self);
     }
     if (ntasks == 0) {
         continue;
@@ -22761,7 +22761,7 @@ while (1) {
                            q_cond_ij, q_cond_kl,
                            s_cond_ij, s_cond_kl, diffuse_exps,
                            (int *)shared_memory, jk, envs, bounds,
-                        component_id, exclude_component_self);
+                           component_id, exclude_component_self);
     }
     if (ntasks == 0) {
         continue;
@@ -24577,7 +24577,7 @@ while (1) {
                            q_cond_ij, q_cond_kl,
                            s_cond_ij, s_cond_kl, diffuse_exps,
                            (int *)shared_memory, jk, envs, bounds,
-                        component_id, exclude_component_self);
+                           component_id, exclude_component_self);
     }
     if (ntasks == 0) {
         continue;
@@ -27053,9 +27053,11 @@ while (1) {
 
 template <bool multi_in, bool exclude_component_self>
 int rys_ejk_ip1_unrolled_template(RysIntEnvVars *envs, JKEnergy *jk, BoundsInfo *bounds,
-                        float *q_cond_ij, float *q_cond_kl, float dm_penalty,
-                        float *s_cond_ij, float *s_cond_kl, float *diffuse_exps,
-                        uint32_t *pool, double *dd_pool, int *head, int workers, double **dms, int *component_id, int *local_ao_loc, int *component_nao)
+                                float *q_cond_ij, float *q_cond_kl, float dm_penalty,
+                                float *s_cond_ij, float *s_cond_kl, float *diffuse_exps,
+                                uint32_t *pool, double *dd_pool, int *head, int workers,
+                                double **dms, int *component_id, int *local_ao_loc,
+                                int *component_nao)
 {
     int li = bounds->li;
     int lj = bounds->lj;

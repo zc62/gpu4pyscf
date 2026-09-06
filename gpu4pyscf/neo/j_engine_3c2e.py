@@ -171,8 +171,9 @@ class Int3c2eOpt:
             local_ao_loc[idx] = opt_t.mol.ao_loc[inv_sorted[shell_local[idx]]]
 
         ls = np.asarray(mol._bas[:,ANG_OF], dtype=np.int32)
-        ll = ls[:,None] + ls
-        ll = ll.ravel()[shl_pair_idx]
+        # Only retained component-local pairs need a Hermite expansion size.
+        ish, jsh = np.divmod(shl_pair_idx, nbas)
+        ll = ls[ish] + ls[jsh]
         xyz_size = (ll+1)*(ll+2)*(ll+3)//6
         self.pair_loc = np.cumsum(np.append(np.int32(0), xyz_size.ravel()), dtype=np.int32)
 

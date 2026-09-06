@@ -29,11 +29,20 @@ def _constraint_groups(mf, keys, fock0, s1e):
         position_indices = [item[2] for item in group]
         if len(group_keys) != len(position_batch):
             position_batch = position_batch[position_indices]
+        fock = cupy.stack([fock0[t] for t in group_keys])
+        overlap = cupy.stack([s1e[t] for t in group_keys])
+        if fock.dtype != overlap.dtype:
+            overlap = overlap.astype(fock.dtype)
+        chol = cupy.linalg.cholesky(overlap)
+        # _eig_batch's metric reduction, performed once for the frozen Fock.
+        fock = hf._transform_by_cholesky(fock, chol)
+        # Apply the same reduction to all three position operators. Trials
+        # then need neither metric reduction nor AO orbital back-transformation.
+        chol = cupy.broadcast_to(chol[:,None], position_batch.shape)
+        position_batch = hf._transform_by_cholesky(position_batch, chol)
         constraint_groups.append((
             cupy.asarray([key_index[t] for t in group_keys]),
-            cupy.stack([fock0[t] for t in group_keys]),
-            cupy.stack([s1e[t] for t in group_keys]),
-            position_batch,
+            fock, position_batch,
             cupy.arange(len(group_keys)),
             cupy.asarray([comp.nuc_occ_state for comp in components])))
     return constraint_groups
@@ -48,11 +57,11 @@ def _evaluate_position_response(f_lagrange, constraint_groups,
         degenerate = cupy.zeros(len(f_lagrange), dtype=bool)
     else:
         jacobians = degenerate = None
-    for indices, fock0, overlap, int1e_r, rows, states in constraint_groups:
-        # Equal-sized nuclear components share one generalized eigensolve.
+    for indices, fock0, int1e_r, rows, states in constraint_groups:
+        # Equal-sized nuclear components share one orthonormal-basis eigensolve.
         multipliers = f_lagrange[indices]
         fock = fock0 + cupy.einsum('txij,tx->tij', int1e_r, multipliers)
-        mo_energy, mo_coeff = hf._eig_batch(fock, overlap)
+        mo_energy, mo_coeff = cupy.linalg.eigh(fock)
         occupied = mo_coeff[rows,:,states]
         deviation = cupy.einsum('tp,txpq,tq->tx', occupied.conj(),
                                  int1e_r, occupied).real
@@ -129,8 +138,9 @@ def update_lagrange_multipliers(mf, fock0, s1e, one_step=False,
         valid = unconverged & (direction_norm != 0) & cupy.isfinite(direction_norm)
         step_size = cupy.ones(len(keys))
         trial = f_lagrange + direction
+        # Line-search trials need position errors, not orbital response.
         trial_deviations, _, _ = _evaluate_position_response(
-            trial, constraint_groups, gap_tol)
+            trial, constraint_groups, with_jacobian=False)
         trial_norm = cupy.linalg.norm(trial_deviations, axis=1)
 
         while cupy.any(valid & (trial_norm >= deviation_norm) &
@@ -145,7 +155,7 @@ def update_lagrange_multipliers(mf, fock0, s1e, one_step=False,
             step_size = cupy.where(rejected, step_size * factor, step_size)
             trial = f_lagrange + step_size[:,None] * direction
             trial_deviations, _, _ = _evaluate_position_response(
-                trial, constraint_groups, gap_tol)
+                trial, constraint_groups, with_jacobian=False)
             trial_norm = cupy.linalg.norm(trial_deviations, axis=1)
 
         accepted = valid & (trial_norm < deviation_norm)

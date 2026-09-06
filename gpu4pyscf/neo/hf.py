@@ -85,6 +85,14 @@ def _grouped_hcore(components, mols, int1e_opt=None):
     return hcore
 
 
+def _transform_by_cholesky(h, chol):
+    '''Transform a matrix batch to L^-1 h L^-H, with chol = L.'''
+    h_orth = cupy.linalg.solve(chol, h)
+    h_orth = cupy.linalg.solve(
+        chol, h_orth.swapaxes(-1, -2).conj()).swapaxes(-1, -2).conj()
+    return h_orth
+
+
 def _eig_batch(h, s=None, x=None):
     if x is None:
         if h.dtype != s.dtype:
@@ -92,9 +100,7 @@ def _eig_batch(h, s=None, x=None):
         chol = cupy.linalg.cholesky(s)
         if chol.ndim < h.ndim:
             chol = cupy.broadcast_to(chol, h.shape)
-        h_orth = cupy.linalg.solve(chol, h)
-        h_orth = cupy.linalg.solve(
-            chol, h_orth.swapaxes(-1, -2).conj()).swapaxes(-1, -2).conj()
+        h_orth = _transform_by_cholesky(h, chol)
         energy, coeff_orth = cupy.linalg.eigh(h_orth)
         coeff = cupy.linalg.solve(chol.swapaxes(-1, -2).conj(), coeff_orth)
     else:

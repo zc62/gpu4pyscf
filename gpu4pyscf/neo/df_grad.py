@@ -9,6 +9,7 @@ from gpu4pyscf.df.grad import rhf as df_rhf_grad
 from gpu4pyscf.df.int3c2e_bdiv import (
     int2c2e, int2c2e_ip1_per_atom, int3c2e_scheme)
 from gpu4pyscf.lib import logger
+from gpu4pyscf.lib.cupy_helper import contract
 from gpu4pyscf.neo import df as neo_df
 from gpu4pyscf.neo import grad, int3c2e_bdiv
 
@@ -154,9 +155,15 @@ def _j_energy_per_atom(int3c2e_opt, dm, hermi=0, auxbasis_response=True,
         # Remove nuclear self-products excluded from the NEO Coulomb energy.
         if df_nn:
             dm_aux = rho_total[:,None] * rho_total
-            for t in int3c2e_opt.component_names:
-                if t != 'e':
-                    dm_aux -= charges[t]**2 * rho[t][:,None] * rho[t]
+            # Rows hold nuclear auxiliary densities; subtract all self-products
+            # in one contraction instead of one auxiliary-square array per nucleus.
+            nuclear_keys = [t for t in int3c2e_opt.component_names if t != 'e']
+            if nuclear_keys:
+                rho_n = cp.empty((len(nuclear_keys), rho_total.size), dtype=rho_total.dtype)
+                for i, t in enumerate(nuclear_keys):
+                    cp.multiply(rho[t], charges[t], out=rho_n[i])
+                dm_aux = contract('ir,is->rs', rho_n, rho_n,
+                                  alpha=-1, beta=1, out=dm_aux)
         else:
             rho_n = sum(charges[t] * rho[t]
                         for t in int3c2e_opt.component_names if t != 'e')
