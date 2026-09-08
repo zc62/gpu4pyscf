@@ -63,18 +63,18 @@ def _evaluate_position_response(f_lagrange, constraint_groups,
         fock = fock0 + cupy.einsum('txij,tx->tij', int1e_r, multipliers)
         mo_energy, mo_coeff = cupy.linalg.eigh(fock)
         occupied = mo_coeff[rows,:,states]
-        deviation = cupy.einsum('tp,txpq,tq->tx', occupied.conj(),
-                                 int1e_r, occupied).real
+        # Reuse <occupied|r in both the position and orbital response.
+        position_occ = cupy.einsum('tp,txpq->txq', occupied.conj(), int1e_r)
+        deviation = cupy.einsum('txq,tq->tx', position_occ, occupied).real
         deviations[indices] = deviation
         if with_jacobian:
             # Frozen-Fock occupied-orbital response gives d<r>/df.
-            coupling = cupy.einsum('tp,txpq,tqa->txa', occupied.conj(),
-                                   int1e_r, mo_coeff)
+            coupling = cupy.matmul(position_occ, mo_coeff)
             energy_gap = mo_energy - mo_energy[rows,states,None]
             mask = cupy.abs(energy_gap) > gap_tol
             mask[rows,states] = False
-            inverse_gap = cupy.zeros_like(energy_gap)
-            inverse_gap[mask] = 1 / energy_gap[mask]
+            # Keep the orbital axis fixed instead of compacting masked gaps.
+            inverse_gap = 1 / cupy.where(mask, energy_gap, cupy.inf)
             jacobian = -2 * cupy.einsum('txa,tya,ta->txy', coupling,
                                         coupling.conj(), inverse_gap).real
             jacobian = (jacobian + jacobian.swapaxes(-1, -2)) * .5
@@ -172,8 +172,8 @@ def update_lagrange_multipliers(mf, fock0, s1e, one_step=False,
     mf.f[atom_indices] = f_lagrange
     for i, t in enumerate(keys):
         ia = mf.components[t].mol.atom_index
-        logger.debug(mf, 'Lagrange multiplier of %s(%i) atom: %s' %
-                     (mf.mol.atom_symbol(ia), ia, mf.f[ia]))
+        logger.debug(mf, 'Lagrange multiplier of %s(%i) atom: %s',
+                     mf.mol.atom_symbol(ia), ia, mf.f[ia])
         logger.debug(mf, 'Position deviation: %s', deviations[i])
     return deviations.ravel()
 

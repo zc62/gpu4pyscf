@@ -138,10 +138,12 @@ def _get_epc_vmat_task(mf, grids, grids_n, sorted_mol_e, dm_e, opt_n, mol_n_all,
                 for n_type in n_slices:
                     n0, n1 = n_slices[n_type]
                     mask_n = (orig_idx_n >= n0) & (orig_idx_n < n1)
-                    idx_n_t = idx_n[mask_n]
+                    # Compact the component AO indices once for both arrays.
+                    idx = cupy.where(mask_n)[0]
+                    idx_n_t = idx_n[idx]
                     if idx_n_t.size == 0:
                         continue
-                    ao_n_t = ao_n[mask_n]
+                    ao_n_t = ao_n[idx]
                     dm_n_mask = dm_n_all[idx_n_t[:,None],idx_n_t]
                     rho_n = numint.eval_rho(sorted_mol_n, ao_n_t,
                                             dm_n_mask, hermi=1)

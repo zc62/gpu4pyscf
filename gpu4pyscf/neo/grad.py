@@ -220,20 +220,21 @@ def _j_intercomponent_energy_per_atom(vhfopt, mols, dms, group1_size,
                     q_cond_ij = q_cond_ij0
                     s_cond_ij = s_cond_ij0
                 else:
-                    pair_mask = _shell_group[ish_ij] == comp_ij
-                    pair_ij_mapping = pair_ij_mapping0[pair_mask]
-                    q_cond_ij = q_cond_ij0[pair_mask]
-                    s_cond_ij = s_cond_ij0[pair_mask]
+                    # Reuse the selected shell pairs for both screening bounds.
+                    pair_idx = cupy.where(_shell_group[ish_ij] == comp_ij)[0]
+                    pair_ij_mapping = pair_ij_mapping0[pair_idx]
+                    q_cond_ij = q_cond_ij0[pair_idx]
+                    s_cond_ij = s_cond_ij0[pair_idx]
 
                 if comp_kl is None:
                     pair_kl_mapping = pair_kl_mapping0
                     q_cond_kl = q_cond_kl0
                     s_cond_kl = s_cond_kl0
                 else:
-                    pair_mask = _shell_group[ish_kl] == comp_kl
-                    pair_kl_mapping = pair_kl_mapping0[pair_mask]
-                    q_cond_kl = q_cond_kl0[pair_mask]
-                    s_cond_kl = s_cond_kl0[pair_mask]
+                    pair_idx = cupy.where(_shell_group[ish_kl] == comp_kl)[0]
+                    pair_kl_mapping = pair_kl_mapping0[pair_idx]
+                    q_cond_kl = q_cond_kl0[pair_idx]
+                    s_cond_kl = s_cond_kl0[pair_idx]
                 npairs_ij = pair_ij_mapping.size
                 npairs_kl = pair_kl_mapping.size
                 if npairs_ij == 0 or npairs_kl == 0:
@@ -628,10 +629,12 @@ def grad_epc(mf_grad, mo_energy=None, mo_coeff=None, mo_occ=None, atmlst=None):
         for n_type in n_types:
             n0, n1 = n_slices[n_type]
             mask_n = (orig_idx_n >= n0) & (orig_idx_n < n1)
-            if not cupy.any(mask_n):
+            # Share component AO selection between density and AO derivatives.
+            idx = cupy.where(mask_n)[0]
+            if idx.size == 0:
                 continue
-            idx_n_t = idx_n[mask_n]
-            ao_n_t = ao_n[:,mask_n]
+            idx_n_t = idx_n[idx]
+            ao_n_t = ao_n[:,idx]
             dm_n_mask = dm_n_all[idx_n_t[:,None],idx_n_t]
             rho_n = numint.eval_rho(sorted_mol_n, ao_n_t[0],
                                     dm_n_mask, hermi=1)

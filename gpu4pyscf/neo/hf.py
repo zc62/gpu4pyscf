@@ -213,8 +213,8 @@ def _grouped_rdm1(components, mo_coeff, mo_occ):
         occupied_value = cupy.max(occ, axis=1)
         # Nuclear get_occ selects one orbital.  This is the original
         # C_occ n C_occ^H density formula evaluated for all components.
-        dm_batch = cupy.einsum('npi,nqi,n->npq', occupied_coeff,
-                               occupied_coeff.conj(), occupied_value)
+        dm_batch = cupy.matmul(occupied_coeff * occupied_value[:,None,None],
+                               occupied_coeff.conj().swapaxes(-1, -2))
         for i, t in enumerate(keys):
             dm[t] = tag_array(dm_batch[i], occ_coeff=occupied_coeff[i],
                               mo_occ=mo_occ[t], mo_coeff=mo_coeff[t])
