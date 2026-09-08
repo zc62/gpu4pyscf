@@ -264,6 +264,30 @@ class KnownValues(unittest.TestCase):
         self.assertTrue(mf_gpu.converged)
         self.assertAlmostEqual(e_gpu, e_cpu, 8)
 
+    def test_rsh_mixing_modes(self):
+        for spin in (0, 1):
+            with self.subTest(spin=spin):
+                mol_h2o = neo.M(atom='O 0 0 0; H 0 -.757 .587; H 0 .757 .587',
+                                basis='6-31g', nuc_basis='pb4d', quantum_nuc=['H'],
+                                charge=spin, spin=spin, verbose=0)
+                results = []
+                for mode in ('mix_outside_kernel', 'mix_inside_kernel'):
+                    mf = gpu_neo.CDFT(mol_h2o, xc='CAMB3LYP', epc=None).density_fit(
+                        auxbasis='def2-universal-jkfit', df_ne=True, df_nn=True)
+                    mf.components['e'].range_separated_mode = mode
+                    mf.components['e'].grids.level = 1
+                    mf.conv_tol = 1e-11
+                    mf.conv_tol_grad = 1e-7
+                    energy = mf.kernel()
+                    self.assertTrue(mf.converged)
+                    grad = mf.nuc_grad_method().kernel()
+                    results.append((energy, grad))
+                # Fitting the mixed operator differs from mixing separately
+                # fitted operators, as in the original RSH integration tests.
+                self.assertLess(abs(results[0][0] - results[1][0]), 1e-6)
+                numpy.testing.assert_allclose(results[0][1], results[1][1],
+                                              atol=1e-6, rtol=0)
+
     def test_schur_e_cderi_matches_eonly_df(self):
         mf_gpu = gpu_neo.KS(mol, xc='B3LYP', epc=None).density_fit(
             df_ne=True, df_ne_j_engine='cderi')

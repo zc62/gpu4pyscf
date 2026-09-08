@@ -4,6 +4,7 @@ import ctypes
 import numpy as np
 import cupy as cp
 from pyscf import lib
+from pyscf.df import addons
 
 from gpu4pyscf.df.grad import rhf as df_rhf_grad
 from gpu4pyscf.df.int3c2e_bdiv import (
@@ -22,6 +23,11 @@ class _ElectronicGradWithoutJ:
                            hermi=0, verbose=None):
         if k_factor == 0:
             return np.zeros((self.mol.natm, 3))
+        # Global J does not build the electronic DF object. Mixed RSH K
+        # builds only its range-separated copy, leaving this auxmol unset.
+        with_df = self.base.with_df
+        if with_df.auxmol is None:
+            with_df.auxmol = addons.make_auxmol(with_df.mol, with_df.auxbasis)
         return super().jk_energy_per_atom(
             dm, 0, k_factor, omega=omega, lr_factor=lr_factor,
             sr_factor=sr_factor, hermi=hermi, verbose=verbose)

@@ -1142,12 +1142,23 @@ class _DFNEO:
                     vxc += vj['e']
                 else:
                     omega, alpha, hyb = ni.rsh_and_hybrid_coeff(mf_e.xc, spin=mol_e.spin)
-                    vk = mf_e.get_k(mol_e, dm_e, hermi)
-                    vk *= hyb
-                    if abs(omega) > 1e-10:
-                        vklr = mf_e.get_k(mol_e, dm_e, hermi, omega=omega)
-                        vklr *= alpha - hyb
-                        vk += vklr
+                    # Global J is already available; only electronic K follows
+                    # the original DF range-separated mixing mode.
+                    if omega != 0:
+                        range_separated_mode = getattr(mf_e, 'range_separated_mode', 'mix_outside_kernel')
+                        if range_separated_mode == 'mix_outside_kernel':
+                            vk = mf_e.get_k(mol_e, dm_e, hermi)
+                            vk *= hyb
+                            vklr = mf_e.get_k(mol_e, dm_e, hermi, omega=omega)
+                            vklr *= (alpha - hyb)
+                            vk += vklr
+                        elif range_separated_mode == 'mix_inside_kernel':
+                            vk = mf_e.get_k(mol_e, dm_e, hermi, omega=omega, lr_factor=alpha, sr_factor=hyb)
+                        else:
+                            raise ValueError(f'range_separated_mode = {range_separated_mode} is not supported')
+                    else: # omega == 0
+                        vk = mf_e.get_k(mol_e, dm_e, hermi)
+                        vk *= hyb
                     vxc += vj['e'] - vk
                     exc -= float(cupy.einsum('sij,sji->', dm_e, vk).real.get()) * .5
                 ecoul = float(cupy.einsum('sij,ji->', dm_e, vj['e']).real.get()) * .5
@@ -1193,12 +1204,23 @@ class _DFNEO:
                     vxc += vj['e']
                 else:
                     omega, alpha, hyb = ni.rsh_and_hybrid_coeff(mf_e.xc, spin=mol_e.spin)
-                    vk = mf_e.get_k(mol_e, dm_e, hermi)
-                    vk *= hyb
+                    # Global J is already available; only electronic K follows
+                    # the original DF range-separated mixing mode.
                     if omega != 0:
-                        vklr = mf_e.get_k(mol_e, dm_e, hermi, omega=abs(omega))
-                        vklr *= alpha - hyb
-                        vk += vklr
+                        range_separated_mode = getattr(mf_e, 'range_separated_mode', 'mix_outside_kernel')
+                        if range_separated_mode == 'mix_outside_kernel':
+                            vk = mf_e.get_k(mol_e, dm_e, hermi)
+                            vk *= hyb
+                            vklr = mf_e.get_k(mol_e, dm_e, hermi, omega=abs(omega))
+                            vklr *= (alpha - hyb)
+                            vk += vklr
+                        elif range_separated_mode == 'mix_inside_kernel':
+                            vk = mf_e.get_k(mol_e, dm_e, hermi, omega=omega, lr_factor=alpha, sr_factor=hyb)
+                        else:
+                            raise ValueError(f'range_separated_mode = {range_separated_mode} is not supported')
+                    else: # omega == 0
+                        vk = mf_e.get_k(mol_e, dm_e, hermi)
+                        vk *= hyb
                     vxc += vj['e'] - vk * .5
                     exc -= float(cupy.einsum('ij,ji->', dm_e, vk).real.get()) * .25
                 ecoul = float(cupy.einsum('ij,ji->', dm_e, vj['e']).real.get()) * .5

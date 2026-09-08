@@ -154,11 +154,13 @@ def _j_intercomponent_energy_per_atom(vhfopt, mols, dms, group1_size,
     dm_penalty = 0
     diffuse_exps, diffuse_ctr_coef = rhf_grad.extract_pgto_params(mol, 'diffuse')
     n_groups = len(uniq_l_ctr)
-    tasks = ((i, j, k, l)
+    tasks = [(i, j, k, l)
              for i in range(n_groups)
              for j in range(i+1)
              for k in range(i+1)
-             for l in range(k+1))
+             for l in range(k+1)]
+    schemes = {t: rhf_grad._ejk_quartets_scheme(mol, uniq_l_ctr[list(t)]) for t in tasks}
+    tasks = iter(tasks)
 
     def proc():
         device_id = cupy.cuda.device.get_device_id()
@@ -200,7 +202,8 @@ def _j_intercomponent_energy_per_atom(vhfopt, mols, dms, group1_size,
         dd_pool = cupy.empty((workers, rhf_grad.DD_CACHE_MAX), dtype=numpy.float64)
         t1 = log.timer_debug1(f'q_cond and dm_cond on Device {device_id}', *cput0)
 
-        for i, j, k, l in tasks:
+        for task in tasks:
+            i, j, k, l = task
             shls_slice = l_ctr_bas_loc[[i, i+1, j, j+1, k, k+1, l, l+1]]
             pair_ij_mapping0, q_cond_ij0, s_cond_ij0 = bas_pair_cache[i,j]
             pair_kl_mapping0, q_cond_kl0, s_cond_kl0 = bas_pair_cache[k,l]
@@ -209,8 +212,7 @@ def _j_intercomponent_energy_per_atom(vhfopt, mols, dms, group1_size,
             ish_ij = pair_ij_mapping0 // mol.nbas
             ish_kl = pair_kl_mapping0 // mol.nbas
             llll = f'({l_symb[i]}{l_symb[j]}|{l_symb[k]}{l_symb[l]})'
-            scheme = rhf_grad._ejk_quartets_scheme(
-                mol, uniq_l_ctr[[i, j, k, l]])
+            scheme = schemes[task]
             component_groups = ((0, 1), (1, 0)) if group1_size is not None else ((None, None),)
             for comp_ij, comp_kl in component_groups:
                 if comp_ij is None:

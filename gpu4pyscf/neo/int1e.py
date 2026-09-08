@@ -38,7 +38,7 @@ def _shell_overlap_mask(mol, shell_component, hermi=1, precision=1e-14):
     exps, cs = extract_pgto_params(mol, 'diffuse')
     exps = cp.asarray(exps, dtype=np.float32)
     log_coeff = cp.log(abs(asarray(cs, dtype=np.float32)))
-    ao_loc = cp.arange(0)
+    ao_loc = cp.zeros(1, dtype=np.int32)
     Ls = cp.zeros((1, 3))
     nimgs = len(Ls)
     ovlp_mask = cp.zeros((nbas,nimgs,nbas), dtype=bool)
@@ -75,7 +75,6 @@ class _Int1eOpt(int1e._Int1eOpt):
         self.hermi = hermi
         self.bvk_kmesh = bvk_kmesh
         self.bvkcell = bvkcell
-        self.Ls = Ls
         self.bvkmesh_Ls = bvkmesh_Ls
 
         _env = _scale_sp_ctr_coeff(bvkcell)

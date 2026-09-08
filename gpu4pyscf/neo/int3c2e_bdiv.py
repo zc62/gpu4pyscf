@@ -32,6 +32,7 @@ def _cache_q_cond_and_non0pairs(mol, rys_envs, precision,
     # Copied from scf.jk._cache_q_cond_and_non0pairs.
     # NEO: shell_component identifies the owner of each sorted shell.
     from gpu4pyscf.pbc.scf.rsjk import libpbc, _group_by_split_points
+    assert isinstance(mol, SortedMole)
     omega = mol.omega
     ls = np.arange(LMAX+1)
     li = ls[:,None]

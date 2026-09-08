@@ -48,12 +48,14 @@ def _grouped_hcore(components, mols, int1e_opt=None):
     from gpu4pyscf.neo import int1e, j_engine_3c2e
 
     component_names = list(components)
+    for mol in mols.values():
+        assert not mol.nucmod
     # Each nuclear component uses the same classical centers but an
     # independent AO basis.  Build their classical-nucleus potential
     # integrals in one component-local 3c2e job.
-    auxmol = gto.mole.fakemol_for_charges(
+    nucmol = gto.mole.fakemol_for_charges(
         next(iter(mols.values())).atom_coords())
-    int3c2e_opt = j_engine_3c2e.Int3c2eOpt(mols, auxmol).build(cutoff=1e-14)
+    int3c2e_opt = j_engine_3c2e.Int3c2eOpt(mols, nucmol).build()
     atom_charges = {t: mols[t].atom_charges() for t in component_names}
     if all(numpy.array_equal(atom_charges[component_names[0]], atom_charges[t])
            for t in component_names[1:]):
@@ -63,6 +65,8 @@ def _grouped_hcore(components, mols, int1e_opt=None):
         auxvec = int3c2e_opt.auxmol.apply_C_dot(auxvec, axis=-1)
         vext = int3c2e_opt.contract_auxvec(auxvec)
     else:
+        # Initial guesses treat the other quantum nuclei as classical, so
+        # each component has a different charge vector on the same centers.
         auxvec = {
             t: int3c2e_opt.auxmol.apply_C_dot(
                 cupy.asarray(-atom_charges[t], dtype=numpy.float64), axis=-1)
@@ -76,12 +80,19 @@ def _grouped_hcore(components, mols, int1e_opt=None):
     for t in component_names:
         comp = components[t]
         mol = mols[t]
-        vext_t = int3c2e_opt.component_opts[t].mol.apply_CT_mat_C(vext[t])
-        # This is the original nuclear-component hcore: q*V + T/m.
-        hcore[t] = vext_t * comp.charge + kinetic[t] / comp.mass
-        mm_mol = getattr(getattr(mol, 'super_mol', None), 'mm_mol', None)
+        # Apply the original C^T V C output transformation per component.
+        h = int3c2e_opt.component_opts[t].mol.apply_CT_mat_C(vext[t])
+        # Each nucleus has its own charge and mass: q*V + T/m.
+        h *= comp.charge
+        h += kinetic[t] / comp.mass
+        mm_mol = None
+        if hasattr(mol, 'super_mol'):
+            mm_mol = mol.super_mol.mm_mol
+        elif hasattr(mol, 'mm_mol'):
+            mm_mol = mol.mm_mol
         if mm_mol is not None:
-            hcore[t] -= _mm_charge_integrals(mm_mol, mol, int1e_grids) * comp.charge
+            h -= _mm_charge_integrals(mm_mol, mol, int1e_grids) * comp.charge
+        hcore[t] = h
     return hcore
 
 
@@ -289,14 +300,16 @@ class ComponentSCF(Component):
         from gpu4pyscf.pbc.gto.int1e import int1e_kin
         if mol._pseudo and not self.is_nucleus:
             from pyscf.gto import pp_int
-            vext = asarray(pp_int.get_gth_pp(mol)) * self.charge
+            h = asarray(pp_int.get_gth_pp(mol)) * self.charge
         else:
             assert not mol.nucmod
-            from gpu4pyscf.df.int3c2e_bdiv import contract_int3c2e_auxvec
+            from gpu4pyscf.df.j_engine_3c2e import contract_int3c2e_auxvec
             nucmol = gto.mole.fakemol_for_charges(mol.atom_coords())
             Z = cupy.asarray(mol.atom_charges(), dtype=numpy.float64)
-            vext = contract_int3c2e_auxvec(mol, nucmol, -Z) * self.charge
-        h = vext + int1e_kin(mol) / self.mass
+            h = contract_int3c2e_auxvec(mol, nucmol, -Z)
+            # NEO scales the potential by the component charge and T by mass.
+            h *= self.charge
+        h += int1e_kin(mol) / self.mass
 
         if len(mol._ecpbas) > 0 and not self.is_nucleus:
             from gpu4pyscf.gto.ecp import get_ecp
@@ -638,12 +651,11 @@ def _kernel(mf, conv_tol=1e-10, conv_tol_grad=None,
     if mo_coeff0 is not None and mo_occ0 is not None:
         dm0['e'] = tag_array(dm0['e'], mo_coeff=mo_coeff0, mo_occ=mo_occ0)
 
-    h1e = {t: cupy.asarray(v) for t, v in mf.get_hcore(mol).items()}
-    s1e = {t: cupy.asarray(v) for t, v in mf.get_ovlp(mol).items()}
-    t1 = log.timer_debug1('hcore', *t1)
-
     dm, dm0 = dm0, None
     vhf = mf.get_veff(mol, dm)
+
+    h1e = {t: cupy.asarray(v) for t, v in mf.get_hcore(mol).items()}
+    s1e = {t: cupy.asarray(v) for t, v in mf.get_ovlp(mol).items()}
     e_tot = mf.energy_tot(dm, h1e, vhf)
     log.info('init E= %.15g', e_tot)
     x_orth = mf.check_linear_dependency(s1e, log)
@@ -712,7 +724,13 @@ def _kernel(mf, conv_tol=1e-10, conv_tol_grad=None,
                          norm_gorb[t], norm_ddm[t])
 
         if dump_chk:
-            mf.dump_chk(locals())
+            mf.dump_chk({
+                'mol': mol,
+                'mo_energy': mo_energy,
+                'mo_occ': mo_occ,
+                'mo_coeff': mo_coeff,
+                'e_tot': e_tot,
+            })
 
         if callable(callback):
             callback(locals())
@@ -726,8 +744,10 @@ def _kernel(mf, conv_tol=1e-10, conv_tol_grad=None,
 
     mf.cycles = cycle + 1
     if scf_conv and mf.level_shift is not None:
+        mo_coeff = mo_occ = mo_energy = mf_diis = None
         # An extra diagonalization, to remove level shift
         mo_energy, mo_coeff = mf.eig(fock, s1e, x=x_orth)
+        fock = None
         mo_occ = mf.get_occ(mo_energy, mo_coeff)
         dm, dm_last = mf.make_rdm1(mo_coeff, mo_occ), dm
         vhf = mf.get_veff(mol, dm, dm_last, vhf)
@@ -1106,8 +1126,8 @@ class HF(scf_gpu.hf.SCF):
     canonicalize = NotImplemented
 
     def dump_chk(self, envs):
-        assert isinstance(envs, dict)
         if self.chkfile:
+            assert isinstance(envs, dict)
             chkfile.dump_scf(self.mol, self.chkfile, envs['e_tot'],
                              _to_cpu(envs['mo_energy']),
                              _to_cpu(envs['mo_coeff']),
