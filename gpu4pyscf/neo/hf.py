@@ -1300,37 +1300,42 @@ class HF(scf_gpu.hf.SCF):
         return new
 
     def reset(self, mol=None):
+        '''Reset mol and relevant attributes associated to the old mol object'''
         if mol is not None:
             self.mol = mol
         super().reset(mol=mol)
-        if sorted(self.components.keys()) == sorted(self.mol.components.keys()):
-            for t, comp in self.components.items():
-                comp.reset(self.mol.components[t])
-                comp._vint = None
-            for interaction in self.interactions.values():
-                interaction._eri = None
-                interaction._vhfopt = None
-        else:
-            self.components.clear()
-            for t, comp in self.mol.components.items():
-                if t.startswith('n'):
-                    charge = -1. * self.mol.atom_charge(comp.atom_index)
-                    mass = self.mol.mass[comp.atom_index] * nist.ATOMIC_MASS / nist.E_MASS
-                    self.components[t] = general_scf(scf_gpu.RHF(comp), charge=charge, mass=mass,
-                                                     is_nucleus=True, nuc_occ_state=0)
-                else:
-                    if self.unrestricted:
-                        mf = scf_gpu.UHF(comp)
-                    elif getattr(comp, 'nhomo', None) is not None or comp.spin != 0:
-                        mf = scf_gpu.UHF(comp)
-                    else:
-                        mf = scf_gpu.RHF(comp)
-                    charge = -1. if t.startswith('p') else 1.
-                    self.components[t] = general_scf(mf, charge=charge)
-            self.interactions.clear()
-            self.interactions.update(hf_cpu.generate_interactions(
-                self.components, InteractionCoulomb,
-                self.max_memory, self.direct_scf_tol))
+        components = self.components.copy()
+        if components.keys() != self.mol.components.keys():
+            self.mo_coeff = None
+        self.components.clear()
+        for t, comp in self.mol.components.items():
+            is_nucleus = t.startswith('n')
+            unrestricted = not is_nucleus and (self.unrestricted or comp.spin != 0 or
+                                               getattr(comp, 'nhomo', None) is not None)
+            mf_class = scf_gpu.uhf.UHF if unrestricted else scf_gpu.hf.RHF
+            mf = components.get(t)
+            # Nuclear membership and electronic spin can change independently.
+            # Keep compatible component objects, including their DF decoration.
+            if isinstance(mf, mf_class):
+                mf.reset(comp)
+            else:
+                mf = mf_class(comp)
+                self.mo_coeff = None
+            if is_nucleus:
+                self.components[t] = general_scf(mf,
+                                                 charge=-1. * self.mol.atom_charge(comp.atom_index),
+                                                 mass=self.mol.mass[comp.atom_index] * nist.ATOMIC_MASS
+                                                      / nist.E_MASS,
+                                                 is_nucleus=True,
+                                                 nuc_occ_state=getattr(mf, 'nuc_occ_state', 0))
+            else:
+                charge = -1. if t.startswith('p') else 1.
+                self.components[t] = general_scf(mf, charge=charge)
+        # Recreate pair molecules and spin flags from the reset components.
+        self.interactions.clear()
+        self.interactions.update(hf_cpu.generate_interactions(
+            self.components, InteractionCoulomb, self.max_memory, self.direct_scf_tol))
+
         return self
 
     def to_cpu(self):

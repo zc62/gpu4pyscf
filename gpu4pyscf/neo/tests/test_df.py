@@ -21,26 +21,54 @@ def tearDownModule():
 
 
 class KnownValues(unittest.TestCase):
-    def test_scanner_different_mol(self):
-        mf_gpu = gpu_neo.CDFT(mol, xc='LDA,VWN', epc=None).density_fit(
-            auxbasis='weigend', df_ne=True)
-        mf_gpu.conv_tol = 1e-10
-        scanner = mf_gpu.nuc_grad_method().as_scanner()
-        scanner(mol)
+    def test_scanner_spin(self):
+        mol = neo.M(atom='H 0 0 0; Li 0 0 1.6', basis='sto-3g',
+                    nuc_basis='pb4d', quantum_nuc=[0], verbose=0)
+        mol2 = neo.M(atom='H 0 0 0; Li 0 0 1.6', basis='sto-3g',
+                     nuc_basis='pb4d', quantum_nuc=[0], charge=1, spin=1, verbose=0)
+        for df_ne in (None, False, True):
+            with self.subTest(df_ne=df_ne):
+                mf = gpu_neo.CDFT(mol, xc='PBE0')
+                if df_ne is not None:
+                    mf = mf.density_fit(auxbasis='weigend', df_ne=df_ne)
+                mf.conv_tol = 1e-10
+                scanner = mf.nuc_grad_method().as_scanner()
+                scanner(mol)
+                for mol_test, unrestricted in ((mol2, False), (mol, False), (mol, True)):
+                    scanner.base.unrestricted = unrestricted
+                    mf_ref = gpu_neo.CDFT(mol_test, xc='PBE0', unrestricted=unrestricted)
+                    if df_ne is not None:
+                        mf_ref = mf_ref.density_fit(auxbasis='weigend', df_ne=df_ne)
+                    mf_ref.conv_tol = 1e-10
+                    e, grad = scanner(mol_test)
+                    self.assertAlmostEqual(e, mf_ref.scf(), 8)
+                    self.assertTrue(abs(grad-mf_ref.nuc_grad_method().kernel()).max() < 1e-6)
+                    self.assertEqual(isinstance(scanner.base.components['e'], gpu_scf.uhf.UHF),
+                                     unrestricted or mol_test.spin != 0)
 
+    def test_scanner_different_mol(self):
         mol_h2o = neo.M(atom='''O  0.000000  0.000000  0.000000
                                 H  0.000000 -0.757000  0.587000
                                 H  0.000000  0.757000  0.587000''',
                          basis='sto-3g', nuc_basis='pb4d', quantum_nuc=[1,2],
                          verbose=0)
-        mf_cpu = neo.CDFT(mol_h2o, xc='LDA,VWN', epc=None).density_fit(
-            auxbasis='weigend', df_ne=True)
-        mf_cpu.conv_tol = mf_gpu.conv_tol
-        e_cpu = mf_cpu.kernel()
-        grad_cpu = mf_cpu.nuc_grad_method().kernel()
-        e_gpu, grad_gpu = scanner(mol_h2o)
-        self.assertAlmostEqual(e_gpu, e_cpu, 9)
-        numpy.testing.assert_allclose(grad_gpu, grad_cpu, atol=2e-7)
+        for df_ne, df_nn in ((False, False), (True, False), (True, True)):
+            with self.subTest(df_ne=df_ne, df_nn=df_nn):
+                mf = gpu_neo.CDFT(mol, xc='LDA,VWN', epc=None).density_fit(
+                    auxbasis='weigend', df_ne=df_ne, df_nn=df_nn)
+                mf.conv_tol = 1e-10
+                scanner = mf.nuc_grad_method().as_scanner()
+                scanner(mol)
+                mf_e = scanner.base.components['e']
+                for mol_test in (mol_h2o, mol):
+                    mf_ref = gpu_neo.CDFT(mol_test, xc='LDA,VWN', epc=None).density_fit(
+                        auxbasis='weigend', df_ne=df_ne, df_nn=df_nn)
+                    mf_ref.conv_tol = mf.conv_tol
+                    e, grad = scanner(mol_test)
+                    self.assertAlmostEqual(e, mf_ref.scf(), 8)
+                    numpy.testing.assert_allclose(
+                        grad, mf_ref.nuc_grad_method().kernel(), atol=1e-6)
+                    self.assertIs(scanner.base.components['e'], mf_e)
 
     def test_hf_df_ne(self):
         mf_cpu = neo.HF(mol).density_fit(df_ne=True)

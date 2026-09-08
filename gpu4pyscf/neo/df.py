@@ -1023,21 +1023,35 @@ class _DFNEO:
         return obj
 
     def reset(self, mol=None):
-        component_keys = set(self.components)
+        e_with_df = self.components['e'].with_df
         if self.with_df is not None:
             self.with_df.reset(mol)
         super().reset(mol)
-        if component_keys != set(self.components):
-            density_fit(self, auxbasis=self.with_df.auxbasis,
-                        with_df=self.with_df,
-                        ee_only_dfj=self.ee_only_dfj,
-                        df_ne=self.df_ne, df_nn=self.df_nn,
-                        df_ne_scheme=self.with_df.df_ne_scheme,
-                        nuc_auxbasis=self.with_df.nuc_auxbasis,
-                        nuc_auxbasis_beta=self.with_df.nuc_auxbasis_beta,
-                        nuc_auxbasis_lmax=self.with_df.nuc_auxbasis_lmax,
-                        df_ne_component_vint=self.df_ne_component_vint,
-                        df_ne_j_engine=self.with_df.df_ne_j_engine)
+        mf_e = self.components['e']
+        if not isinstance(mf_e, df_jk._DFHF):
+            # A spin change replaced the electronic component. Restore only its
+            # ordinary DF wrapper, retaining the DF settings.
+            e_with_df.reset(mf_e.mol)
+            mf_e = hf.general_scf(df_jk.density_fit(mf_e.undo_component(),
+                                                    with_df=e_with_df,
+                                                    only_dfj=self.ee_only_dfj),
+                                  charge=mf_e.charge, mass=mf_e.mass,
+                                  is_nucleus=mf_e.is_nucleus,
+                                  nuc_occ_state=mf_e.nuc_occ_state)
+            self.components['e'] = mf_e
+            # The parent already constructed the pair molecules and spin flags.
+            # Only the electronic SCF reference changes when DF is restored.
+            for interaction in self.interactions.values():
+                if interaction.mf1_type == 'e':
+                    interaction.mf1 = mf_e
+                if interaction.mf2_type == 'e':
+                    interaction.mf2 = mf_e
+        if self.df_ne:
+            self.with_df._charges.clear()
+            for t, comp in self.components.items():
+                self.with_df._charges[t] = comp.charge
+            if self.with_df.df_ne_scheme == 'global':
+                self.with_df._elec_with_df = mf_e.with_df
         return self
 
     def get_j(self, mol=None, dm=None, hermi=1, omega=None):

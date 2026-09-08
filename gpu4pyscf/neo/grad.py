@@ -685,7 +685,8 @@ class Gradients(rhf_grad.GradientsBase):
         if mol is not None:
             self.mol = mol
         self.base.reset(self.mol)
-        if sorted(self.components.keys()) == sorted(self.mol.components.keys()):
+        if (self.components.keys() == self.base.components.keys() and
+            all(comp.base is self.base.components[t] for t, comp in self.components.items())):
             for t, comp in self.components.items():
                 comp.reset(self.mol.components[t])
         else:
