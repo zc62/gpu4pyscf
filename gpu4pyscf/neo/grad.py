@@ -599,9 +599,9 @@ def grad_epc(mf_grad, mo_energy=None, mo_coeff=None, mo_occ=None, atmlst=None):
             continue
 
         ao_n = numint.eval_ao(
-            sorted_mol_n, coords, deriv=1, nao_slice=len(idx_n),
-            shls_slice=non0shl_idx, ao_loc_slice=ao_loc_slice,
-            ctr_offsets_slice=ctr_offsets_slice, gdftopt=opt_n,
+            sorted_mol_n, coords, deriv=1,
+            screening_info=(len(idx_n), non0shl_idx, ao_loc_slice, ctr_offsets_slice),
+            gdftopt=opt_n,
             transpose=False)
         if pad > 0:
             ao_n[:,-pad:] = 0.0
